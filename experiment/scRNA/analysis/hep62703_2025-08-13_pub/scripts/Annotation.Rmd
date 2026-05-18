@@ -1,0 +1,112 @@
+---
+title: "Annotation"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  config_id: ""
+  date: !r Sys.Date()
+---
+
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", config_id = "T-cell-subtypes", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "yaml")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r parameters, echo=FALSE}
+
+config_id <- params$config_id
+config_key <- paste0("annotation", ifelse(nzchar(config_id), "_", ""), config_id)
+
+ident_col <- config[[config_key]]$ident_col
+annotation_col <- config[[config_key]]$annotation_col
+annotation_map_path <- config[[config_key]]$annotation_map
+
+```
+
+```{r load_data, echo=FALSE }
+
+seurat_obj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+annotation_map_table <- read.csv(file.path(analysis_dir, annotation_map_path), colClasses = "character")
+
+```
+
+```{r set_annotation, echo=FALSE }
+
+annotation_map <- as.character(annotation_map_table$annotation)
+names(annotation_map) <- as.character(annotation_map_table$cluster)
+
+seurat_obj[[]][[annotation_col]] <- sapply(
+    as.character(seurat_obj[[]][[ident_col]]),
+    function(x) annotation_map[x]
+)
+
+seurat_obj[[]][[annotation_col]] <- factor(
+  seurat_obj[[]][[annotation_col]],
+  levels = sort(unique(seurat_obj[[]][[annotation_col]]))
+)
+
+```
+
+```{r save_seurat_object, echo=FALSE }
+
+saveRDS(
+    seurat_obj,
+    file.path(analysis_dir, config[["Seurat_filtered"]])
+)
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

@@ -1,0 +1,131 @@
+inputpath: protected/scRNA_cellranger_2025-06-25
+libs_exclude: ~
+outputpath:
+  fig: fig
+  table: table
+  data: data
+  report: report
+cellhash: no
+remove_doublets: computed
+on_chip_multiplexing: yes
+metadata_spec:
+  metadata_spec_file: ~
+  shorten_sample_names: yes
+  n_char_shortened: 8
+singlerRefpath: /misc/rci/refdata/SingleR
+species: homo sapiens
+filters:
+  min_lib_ncounts: 1000
+  min_n_feats: 200
+  max_pct_mt: 10
+  min_cells: 5
+scParam:
+  PCfrom: 1
+  PCto:
+  - 10
+  - 20
+  VarFeat: 2000
+  cluster_on: harmony_1_20
+  cluster_res:
+  - 0.05
+  - 0.1
+  - 0.15
+  - 0.25
+  - 0.3
+  - 0.35
+  - 0.45
+  - 0.5
+  - 0.55
+  - 0.7
+  clusters: RNA_snn_res.0.35
+  dimred: umap_harmony_1_20
+  regress_cc: yes
+  regress_cc_score: UCell
+integration:
+  integrate: yes
+  batch_info_file: table/batch_info.csv
+  methods:
+  - harmony
+  - fastMNN
+  - rpca
+annotation_CD4-CD8:
+  ident_col: RNA_snn_res.0.35
+  annotation_col: annot_CD4_CD8
+  annotation_map_path: table/annotation_map_CD4_CD8.csv
+annotation_T-cell-subtypes:
+  ident_col: RNA_snn_res.0.35
+  annotation_col: annot_T_cell_subtypes
+  annotation_map_path: table/annotation_map_T-cell-subtypes.csv
+markers: table/markers_T_cells_NK.csv
+signatures: table/markers_T_cells_NK.csv
+run_liana: no
+run_shinycell: yes
+model_variables:
+  group:
+    source_col: group
+    ctrl: DMSO
+  lib:
+    source_col: lib
+    ctrl: p232-Donor1-run-1
+DE_conditions_CD4-CD8:
+  ident_col: annot_CD4_CD8
+  subjects: replicate-condition
+  sampling:
+    sample: no
+  comparisons:
+    group:
+      defaults: yes
+      contrasts:
+      - - IVA
+        - ICA
+      - - VA
+        - ICA
+      - - IVA
+        - VA
+    lib:
+      defaults: yes
+  fit_results: data/fit_DE_cond_nebula-CD4-CD8.rds
+  results: data/DE_cond_nebula-CD4-CD8.rds
+GSEA_conditions_CD4-CD8_A:
+  DE_data: DE_conditions_CD4-CD8
+  collections:
+  - HALLMARK
+  - KEGG
+  - WIKIPATHWAYS
+  - REACTOME
+  - GO_BP
+  fraction_threshold: 0.7
+  comparisons:
+  - - ICA
+    - DMSO
+  - - IVA
+    - DMSO
+  - - VA
+    - DMSO
+  - - IVA
+    - ICA
+  - - VA
+    - ICA
+  - - IVA
+    - VA
+  results: data/GSEA_cond_nebula-CD4-CD8_A.rds
+Seurat_rawobj:
+  p232-Donor1-run-1--DMSO: data/SeuratObj_raw_p232-Donor1-run-1--DMSO.rds
+  p232-Donor1-run-1--ICA: data/SeuratObj_raw_p232-Donor1-run-1--ICA.rds
+  p232-Donor1-run-1--IVA: data/SeuratObj_raw_p232-Donor1-run-1--IVA.rds
+  p232-Donor1-run-1--VA: data/SeuratObj_raw_p232-Donor1-run-1--VA.rds
+  p232-Donor2-run-1--DMSO: data/SeuratObj_raw_p232-Donor2-run-1--DMSO.rds
+  p232-Donor2-run-1--ICA: data/SeuratObj_raw_p232-Donor2-run-1--ICA.rds
+  p232-Donor2-run-1--IVA: data/SeuratObj_raw_p232-Donor2-run-1--IVA.rds
+  p232-Donor2-run-1--VA: data/SeuratObj_raw_p232-Donor2-run-1--VA.rds
+  p232-Donor3-run-1--DMSO: data/SeuratObj_raw_p232-Donor3-run-1--DMSO.rds
+  p232-Donor3-run-1--ICA: data/SeuratObj_raw_p232-Donor3-run-1--ICA.rds
+  p232-Donor3-run-1--IVA: data/SeuratObj_raw_p232-Donor3-run-1--IVA.rds
+  p232-Donor3-run-1--VA: data/SeuratObj_raw_p232-Donor3-run-1--VA.rds
+  p232-Donor5-run-1--DMSO: data/SeuratObj_raw_p232-Donor5-run-1--DMSO.rds
+  p232-Donor5-run-1--ICA: data/SeuratObj_raw_p232-Donor5-run-1--ICA.rds
+  p232-Donor5-run-1--IVA: data/SeuratObj_raw_p232-Donor5-run-1--IVA.rds
+  p232-Donor5-run-1--VA: data/SeuratObj_raw_p232-Donor5-run-1--VA.rds
+Seurat_rawall: data/SeuratObj_raw_merged.rds
+Seurat_filtered: data/SeuratObj_filtered.rds
+all_markers: table/Seurat_filtered_RNA_snn_res_0_35_all_markers.xlsx

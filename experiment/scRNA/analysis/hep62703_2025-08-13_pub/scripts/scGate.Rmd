@@ -1,0 +1,188 @@
+---
+title: "scGate annotation"
+author: "Paul Heinrich"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+---
+
+```{r date, echo=FALSE}
+
+today <- Sys.Date()
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries,include=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+
+# libraries
+
+libload<-c(
+  "rprojroot", "yaml", "Seurat", "tidyverse", "stringr",
+  "future", "patchwork", "viridis", "scGate"
+)
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, message = F, warning= F, error=T}
+
+save_data <- TRUE
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+project_dir <- root_directories[["project"]]
+
+config <- yaml.load_file("config.yaml")
+
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r loaddata}
+
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_filtered))
+
+```
+
+```{r scGate_models }
+
+# Predefined models from scGate_models repository, commit c07ea2e778ce8db4ebb33bfb3e5c8fe85706dd36
+# (https://github.com/carmonalab/scGate_models/commit/c07ea2e778ce8db4ebb33bfb3e5c8fe85706dd36)
+
+scGate_model_db_path <- file.path(project_dir, "experiment/scRNA/analysis/reference/scGate_models")
+scGate_model_db_path_pre <- file.path(scGate_model_db_path, "predefined/human")
+
+scGate_classes <- c(
+  "CD4_TIL",
+  "CD8_TIL",
+  "PBMC"
+)
+
+scGate_model_names <- list()
+
+for (target_class in scGate_classes) {
+  curr_files <- list.files(file.path(scGate_model_db_path_pre, target_class))
+  curr_files <- curr_files[!(curr_files == "master_table.tsv")]
+  curr_names <- str_remove(curr_files, "_scGate_Model.tsv$")
+  scGate_model_names[[target_class]] <- curr_names
+}
+
+scGate_models <- list()
+
+for (target_class in scGate_classes) {
+  scGate_models[[target_class]] <- list()
+  base_path <- file.path(scGate_model_db_path_pre, target_class)
+
+  for (model_name in scGate_model_names[[target_class]]) {
+
+    scGate_models[[target_class]][[model_name]] <- load_scGate_model(
+      model_file = file.path(base_path, paste0(model_name, "_scGate_Model.tsv")),
+      master.table = file.path(base_path, "master_table.tsv")
+    )
+  }
+}
+
+```
+
+```{r scGate_T_cells_broad }
+
+models_T_cells_broad <- list(
+  "CD4T" = scGate_models$PBMC$CD4T,
+  "CD8T" = scGate_models$PBMC$CD8T,
+  "Treg" = scGate_models$CD4_TIL$Treg
+)
+
+SObj <- scGate(SObj, model = models_T_cells_broad)
+
+# Create annotation column from pure/impure labels
+
+scGate_celltypes <- names(models_T_cells_broad)
+scGate_celltype_cols <- paste0("is.pure_", scGate_celltypes)
+names(scGate_celltype_cols) <- scGate_celltypes
+
+SObj[[]][["scGate_annot_T_cells_broad"]] <- "NA"
+
+for (celltype in names(scGate_celltype_cols)) {
+  curr_annot <- SObj[[]][[scGate_celltype_cols[[celltype]]]] == "Pure"
+  SObj[[]][["scGate_annot_T_cells_broad"]][curr_annot] <- celltype
+}
+
+SObj[[]][["scGate_annot_T_cells_broad"]] <- factor(
+  SObj[[]][["scGate_annot_T_cells_broad"]], levels <- c("NA", scGate_celltypes)
+)
+
+```
+
+```{r scGate_T_cells_fine }
+
+models_T_cells_fine <- c(scGate_models$CD4_TIL, scGate_models$CD8_TIL)
+
+SObj <- scGate(SObj, model = models_T_cells_fine)
+
+# Create annotation column from pure/impure labels
+
+scGate_celltypes <- names(models_T_cells_fine)
+scGate_celltype_cols <- paste0("is.pure_", scGate_celltypes)
+names(scGate_celltype_cols) <- scGate_celltypes
+
+SObj[[]][["scGate_annot_T_cells_fine"]] <- "NA"
+
+for (celltype in names(scGate_celltype_cols)) {
+  curr_annot <- SObj[[]][[scGate_celltype_cols[[celltype]]]] == "Pure"
+  SObj[[]][["scGate_annot_T_cells_fine"]][curr_annot] <- celltype
+}
+
+SObj[[]][["scGate_annot_T_cells_fine"]] <- factor(
+  SObj[[]][["scGate_annot_T_cells_fine"]], levels <- c("NA", scGate_celltypes)
+)
+
+```
+
+```{r save_plots, eval = save_data}
+
+plot_dir <- file.path(analysis_dir, config$outputpath$fig, "scGate")
+
+reduction <- config$scParam$dimred
+
+umap_scGate_broad <- DimPlot(SObj, group.by = "scGate_annot_T_cells_broad", reduction = reduction)
+
+ggsave(
+  file.path(plot_dir, "umap_scGate_T-cells_broad.png"),
+  umap_scGate_broad, width = 8, height = 6, dpi = 300,
+)
+
+umap_scGate_fine <- DimPlot(SObj, group.by = "scGate_annot_T_cells_fine", reduction = reduction)
+
+ggsave(
+  file.path(plot_dir, "umap_scGate_T-cells_fine.png"),
+  umap_scGate_fine, width = 8, height = 6, dpi = 300,
+)
+
+```
+
+```{r save_seurat, eval = save_data}
+
+saveRDS(SObj, file = file.path(analysis_dir, config$Seurat_filtered))
+
+```
+
+## SessionInfo()
+
+```{r sessionInfo,echo=T}
+
+sessionInfo()
+
+```

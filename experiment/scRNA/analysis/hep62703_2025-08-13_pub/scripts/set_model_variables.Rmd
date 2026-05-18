@@ -1,0 +1,116 @@
+---
+title: "Set variables for regression models on Seurat object"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+# Notes
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "yaml")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+```
+
+```{r load_data, eval=T ,echo=F}
+
+SObj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+```
+
+```{r set_model_variables, eval=T, echo=F}
+
+modelVariablesInfo <- config$model_variables
+
+# Set libraries and groups for models
+
+ctrlGroup <- modelVariablesInfo$group$ctrl
+ctrlLib <- modelVariablesInfo$lib$ctrl
+
+SObj[[]][["lib"]] <- convertLibNames(as.character(SObj[[]][[modelVariablesInfo$lib$source_col]]))
+libs <- sort(unique(SObj[[]][["lib"]]))
+
+if (!is.null(ctrlLib)) {
+    ctrlLib <- convertLibNames(ctrlLib)
+    libs <- rearrangeFactorLevels(libs, ctrlLib)
+}
+
+SObj[[]][["lib"]] <- factor(SObj[[]][["lib"]], levels = libs)
+
+SObj[[]][["group"]] <- str_replace_all(as.character(SObj[[]][[modelVariablesInfo$group$source_col]]), "-", "_")
+groups <- sort(unique(SObj[[]][["group"]]))
+
+if (!is.null(ctrlGroup)) {
+    ctrlGroup <- str_replace_all(ctrlGroup, "-", "_")
+    groups <- rearrangeFactorLevels(groups, ctrlGroup)
+}
+
+SObj[[]][["group"]] <- factor(SObj[[]][["group"]], levels = groups)
+
+# Currently, we simply set replicate to lib, which is a reasonable default. We need the possibility to use
+# a mapping from lib to replicate from the config instead for more complicated cases
+
+replicateMapping <- paste0("R", seq_along(levels(SObj[[]][["lib"]])))
+names(replicateMapping) <- levels(SObj[[]][["lib"]])
+SObj[[]][["repl"]] <- sapply(SObj[[]][["lib"]], function(x) replicateMapping[x])
+SObj[[]][["repl"]] <- factor(SObj[[]][["repl"]], levels = replicateMapping)
+
+```
+
+```{r save_data, echo=FALSE, warning=FALSE }
+
+saveRDS(SObj, file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

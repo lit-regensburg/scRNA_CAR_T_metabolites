@@ -1,0 +1,291 @@
+---
+title: "Comparison statistics for NEBULA differential expression results"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  config_id: ""
+  date: !r Sys.Date()
+---
+
+# Notes
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", config_id = "CD4-CD8", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "yaml", "nebula", "foreach", "doParallel", "WriteXLS")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# Parallelization with doParallel
+
+registerDoParallel(6)
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r parameters, echo=FALSE}
+
+config_id <- params$config_id
+config_key <- paste0("DE_conditions", ifelse(nzchar(config_id), "_", ""), config_id)
+
+comparisonSettings <- config[[config_key]]$comparisons
+modelFitPath <- config[[config_key]]$fit_results
+
+```
+
+```{r load_data,eval=T,echo=F}
+
+modelFit <- readRDS(file.path(analysis_dir, modelFitPath))
+SObj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+```
+
+# Compute statistics for comparisons
+
+```{r contrasts, eval=T, echo=F}
+
+idents <- names(modelFit)
+
+comparisons <- list()
+
+for (variable in names(comparisonSettings)) {
+    currComps <- list()
+    factorLevels <- levels(SObj[[]][[variable]])
+    ctrlLevel <- factorLevels[1]
+
+    if (comparisonSettings[[variable]]$defaults) {
+        factorLevelsExCtrl <- factorLevels[factorLevels != ctrlLevel]
+
+        for (factorLevel in factorLevelsExCtrl) {
+            compName <- paste0(factorLevel, "_vs_", ctrlLevel)
+            compCol <- paste0("logFC_", variable, "_", factorLevel)
+
+            currComps[[compName]] <- compCol
+        }
+    }
+
+    if (!is.null(comparisonSettings[[variable]]$contrasts)) {
+        for (contrast in comparisonSettings[[variable]]$contrasts) {
+            compName <- paste0(contrast[1], "_vs_", contrast[2])
+
+            if (!(ctrlLevel %in% contrast)) {
+                compCols <- c(
+                    paste0("logFC_", variable, "_", contrast[1]),
+                    paste0("logFC_", variable, "_", contrast[2])
+                )
+            } else {
+                nonCtrlLevel <- contrast[contrast != ctrlLevel]
+                compCols <- paste0("logFC_", variable, "_", nonCtrlLevel)
+            }
+
+            if (!(compName %in% names(currComps))) {
+                currComps[[compName]] <- compCols
+            }
+        }
+    }
+
+    comparisons <- c(comparisons, currComps)
+}
+
+contrasts <- list()
+
+coefIdx <- grep("logFC", colnames(modelFit[[1]]$summary))
+coefNames <- colnames(modelFit[[1]]$summary)[coefIdx]
+contrastZeros <- rep(0, length = length(coefNames))
+names(contrastZeros) <- coefNames
+
+for (comparison in names(comparisons)) {
+    currContrast <- contrastZeros
+    currContrast[comparisons[[comparison]][1]] <- 1
+
+    if (length(comparisons[[comparison]]) > 1) {
+        currContrast[comparisons[[comparison]][2]] <- -1
+    }
+
+    contrasts[[comparison]] <- currContrast
+}
+
+```
+
+```{r extract_stats, eval=T, echo=F}
+
+covMatEmpty <- matrix(NA, length(contrastZeros), length(contrastZeros))
+rownames(covMatEmpty) <- names(contrastZeros)
+colnames(covMatEmpty) <- names(contrastZeros)
+
+comparisonStats <- foreach(ident = idents) %dopar% {
+    genes <- modelFit[[ident]]$summary$gene
+    genesInvalid <- genes[modelFit[[ident]]$convergence < -10]
+
+    covMats <- list()
+    geneIdx <- 1
+
+    for (gene in genes) {
+        covMat <- covMatEmpty
+        covMat[lower.tri(covMat, diag=T)] <- as.numeric(modelFit[[ident]]$covariance[geneIdx, ])
+        covMat[upper.tri(covMat)] <- t(covMat)[upper.tri(covMat)]
+        
+        covMats[[gene]] <- covMat
+
+        geneIdx <- geneIdx + 1
+    }
+
+    statTable <- data.frame()
+
+    comparisonNo <- 1
+
+    for (comparison in names(comparisons)) {
+        print(Sys.time())
+        print(paste0("Identity ", ident, ", comparison: ", comparison))
+        print(paste0("Identity ", ident, ", comparison ", comparisonNo, " out of ", length(comparisons)))
+
+        currStats <- rep(NA, length = length(genes))
+        currLogFC <- rep(NA, length = length(genes))
+        geneIdx <- 1
+
+        for (gene in genes) {
+            currContrast <- contrasts[[comparison]]
+
+            coefDiff <- sum(currContrast*modelFit[[ident]]$summary[geneIdx, names(currContrast)])
+            currLogFC[geneIdx] <- coefDiff
+
+            pVal <- as.vector(
+                pchisq(coefDiff^2/(t(currContrast)%*%covMats[[geneIdx]]%*%currContrast), 1, lower.tail = FALSE)
+            )
+            currStats[geneIdx] <- pVal
+
+            geneIdx <- geneIdx + 1
+        }
+
+        currStatTable <- data.frame(
+            comparison = comparison,
+            gene = genes,
+            logFC = currLogFC,
+            p = currStats
+        )
+
+        # Remove invalid genes
+
+        currStatTable <- currStatTable[!(currStatTable$gene %in% genesInvalid), ]
+
+        # P value adjustment per comparison
+
+        currStatTable$p_adj_fdr = p.adjust(currStatTable$p, method = "BH")
+
+        # Append comparison
+
+        statTable <- rbind(statTable, currStatTable)
+
+        comparisonNo <- comparisonNo + 1
+    }
+
+    statTable$comparison <- factor(statTable$comparison, levels = names(comparisons))
+    statTable
+}
+names(comparisonStats) <- idents
+
+```
+
+```{r sanity_check, eval=T, echo=F}
+
+# Sanity check, compare p values obtained via contrasts with p values directly from model
+# Only works if these comparisons (first two) are vs control
+
+for (ident in idents) {
+    print(paste0("Identity ", ident))
+    print(names(comparisons)[1])
+    print(sum(
+        modelFit[[ident]]$summary[modelFit[[ident]]$convergence >= -10, str_replace(comparisons[[1]], "^logFC", "p")] -
+        comparisonStats[[ident]] %>% filter(comparison == names(comparisons)[1]) %>% pull(p)
+    ))
+    print(names(comparisons)[2])
+    print(sum(
+        modelFit[[ident]]$summary[modelFit[[ident]]$convergence >= -10, str_replace(comparisons[[2]], "^logFC", "p")] -
+        comparisonStats[[ident]] %>% filter(comparison == names(comparisons)[2]) %>% pull(p)
+    ))
+}
+
+```
+
+```{r rearrange_data, eval=T, echo=F}
+
+for (ident in idents) {
+    comparisonStats[[ident]] <- comparisonStats[[ident]] %>%
+        arrange(comparison, desc(sign(logFC)*(-1)*log(p_adj_fdr)), desc((-1)*log(p)))
+}
+
+```
+
+```{r save_data, echo=FALSE, warning=FALSE }
+
+commonFilename <- paste0(
+    "DE_cond_nebula",
+    ifelse(nzchar(config_id), paste0("-", config_id), "")
+)
+
+config[[config_key]]$results <- file.path(config$outputpath$data, paste0(commonFilename, ".rds"))
+saveRDS(comparisonStats, file.path(analysis_dir, config[[config_key]]$results))
+write_yaml(config, file = params$config)
+
+for (ident in idents) {
+    currTables <- list()
+
+    for (currComparison in names(comparisons)) {
+        currTables[[currComparison]] <- comparisonStats[[ident]] %>%
+            filter(comparison == currComparison)
+    }
+
+    currFilename <- paste0(commonFilename, "_", ident, ".xlsx")
+    WriteXLS(currTables, file.path(analysis_dir, config$outputpath$table, currFilename))
+}
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

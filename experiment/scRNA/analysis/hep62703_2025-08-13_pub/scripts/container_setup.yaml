@@ -1,0 +1,22 @@
+# Path to containers local:
+
+# container_path: path to container e.g: /misc/rci/software/containers/analysis or
+container_path: /misc/rci/projects/p232_mp_scrna/dev/hep62703/experiment/scRNA/analysis/containers
+# container_name: should point to a .sif file, example: rbioc_3.14-deb10-0.sif
+container_name: projspec_3.17-deb11-0-p232-1.sif
+
+#@harbour
+# add a container registry: example:docker://containers.lit.eu/analysis/rbioc
+container_registry: docker://containers.lit.eu/analysis/rbioc/projspec
+  # specify container tag: example: 3.14-deb10-0
+container_tag: 3.17-deb11-0-p232-1
+container_hash:
+  -sha256: 14fd5184dab3d29f8f90ac44167749dc3bbb9d825386e472ed1071ad32fbbb5c
+
+# Project settings
+# Set the project specific raw directory to bind, example: /misc/rci/projects/p091_vl_10x
+
+bind:
+  - /misc/rci/projects/p232_mp_scrna
+  - /misc/rci/refdata/SingleR
+  - /misc/rci/refdata/GO_genesets

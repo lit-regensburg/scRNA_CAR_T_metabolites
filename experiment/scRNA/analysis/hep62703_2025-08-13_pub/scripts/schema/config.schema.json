@@ -1,0 +1,263 @@
+{
+  "no$id": "https://lit.eu/ngscore/scanalysisscripts/config.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scanalysisscripts config",
+  "description": "Configuration options for the single cell analysis pipeline",
+  "type": "object",
+  "required": [
+    "inputpath",
+    "outputpath",
+    "cellhash",
+    "metadata_spec",
+    "singlerRefpath",
+    "species",
+    "filters",
+    "scParam",
+    "integration",
+    "markers",
+    "signatures",
+    "run_liana",
+    "run_shinycell"
+  ],
+  "properties": {
+      "inputpath": {
+          "type": "string",
+          "description": "relative path to cellranger input files from the data or project root"
+      },
+      "libs_exclude": {
+        "oneOf": [
+          {
+            "type": ["array"],
+            "items": {"type": "string"}
+          },
+          { "type": "string" },
+          { "type": "null" }
+        ],
+        "default": null,
+        "description": "Names of libraries to exclude"
+      },
+      "outputpath": {
+          "type": "object",
+          "description": "paths to generated output files, relative to the analysis root",
+          "properties": {
+              "fig": {
+                  "type": "string",
+                  "description": "path to output figures"
+              },
+              "table": {
+                  "type": "string",
+                  "description": "path to output tables"
+              },
+              "data": {
+                  "type": "string",
+                  "description": "path to output data"
+              },
+              "report": {
+                  "type": "string",
+                  "description": "path to output reports"
+              }
+          },
+          "required": ["fig", "table", "data", "report"]
+      },
+      "cellhash": {
+        "type": "boolean",
+        "description": "???"
+      },
+      "metadata_spec": {
+          "type": "object",
+          "description": "Parameters for metadata specification.",
+          "required": ["shorten_sample_names"],
+          "properties": {
+              "metadata_spec_file": {
+                  "type": ["string", "null"],
+                  "default": null,
+                  "description": "Path to csv file with metadata column specification."
+              },
+              "shorten_sample_names": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Shorten automatically created sample names in the case of cell hashing?"
+              },
+             "n_char_shortened": {
+                  "type": ["integer", "null"],
+                  "default": 8,
+                  "description": "Maximum number of characters for shortend library names and hash IDs when automatically creating sample names."
+              }
+          }
+      },
+      "singlerRefpath": {
+          "type": "string",
+          "description": "Path to SingleR reference data."
+      },
+      "species": {
+          "type": "string",
+          "enum": [ "mus musculus", "homo sapiens" ],
+          "description": "species under investigation."
+      },
+      "filters": {
+          "type": "object",
+          "description": "filter settings for QC of single cells",
+          "properties": {
+              "min_lib_ncounts": {
+                  "type": "integer",
+                  "default": 500,
+                  "minimum": 50,
+                  "description": "minimum number of counts???"
+              },
+              "min_n_feats": {
+                  "type": "integer",
+                  "default": 250,
+                  "minimum": 50,
+                  "description": "minimum number of features (genes) in every cell ???"
+              },
+              "max_pct_mt": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100,
+                  "default": 5,
+                  "description": "maximum percentage of mitochondrial counts ???"
+              },
+              "min_cells": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1000,
+                  "default": 5,
+                  "description": "???"
+              }
+          }
+      },
+      "scParam": {
+          "type": "object",
+          "description": "parameters for single cell analysis",
+          "required": ["PCfrom", "PCto", "VarFeat", "dimred", "cluster_on", "clusters"],
+          "properties": {
+              "PCfrom": {
+                  "oneOf": [
+                  {
+                      "type": "integer",
+                      "minimum": 1
+                  },
+                  {
+                      "type": "array",
+                      "default": [1],
+                  "items": {
+                      "type": "integer",
+                      "minimum": 1
+                  },
+                  "minItems": 1,
+                  "description": "Lower boundary for range of principal components"
+                  }
+                  ]
+              },
+              "PCto": {
+                  "oneOf": [
+                  {
+                      "type": "integer",
+                      "minimum": 1
+                  },
+                  {
+                      "type": "array",
+                      "default": [10,20,50],
+                      "items": {
+                        "type": "integer",
+                        "minimum": 2
+                      },
+                      "minItems": 1,
+                      "description": "Upper boundary for range of principal components"
+                  }
+                  ]
+              },
+              "VarFeat": {
+                  "type": "integer",
+                  "minimum": 5,
+                  "maximum": 5000,
+                  "default": 1000,
+                  "description": "Number of variable features used for dimensionality reduction"
+              },
+              "dimred": {
+                  "type": "string",
+                  "default": "umap_1_20",
+                  "description": "name of the dimensionality reduction to use for plotting"
+              },
+              "cluster_on": {
+                  "type": "string",
+                  "default": "pca_1_20",
+                  "description": "name of the dimensionality reduction to use for clustering"
+              },
+              "clusters": {
+                  "description": "name of clustering object to use",
+                  "type": "string",
+                  "default": "RNA_snn_res.0.2"
+              }
+          }
+      },
+      "integration": {
+          "type": "object",
+          "description": "Define settings for integration of batches.",
+          "required": ["integrate"],
+          "properties": {
+              "integrate": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Perform integration on batches?"
+              },
+              "batch_info_file": {
+                  "type": ["string", "null"],
+                  "default": null,
+                  "description": "Path to csv file that contains batch information."
+              },
+              "methods": {
+                  "type": ["array", "null"],
+                  "items": {
+                      "type": "string",
+                      "enum": ["harmony", "fastMNN", "rpca", "cca", "jpca"]
+                  },
+                  "default": ["harmony", "fastMNN", "rpca"],
+                  "description": "Integration methods to apply."
+              }
+          }
+      },
+      "markers": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "filename of a markers definition file, relative to the  analysis root."
+      },
+      "signatures": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "filename of a signatures definition file, relative to the analysis root."
+      },
+      "run_liana": {
+                  "type": "boolean",
+                  "description": "run liana interaction script",
+                  "default": false
+      },
+      "run_shinycell": {
+                  "type": "boolean",
+                  "description": "run liana interaction script",
+                  "default": false
+      },
+      "scDbl_results": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "filename pointing to the doublet detection result."
+      },
+      "Seurat_rawobj": {
+          "type": "object",
+          "items": {
+              "type": "string"
+          },
+          "description": "filenames pointing to the single-sample Seurat objects."
+      },
+      "Seurat_rawall": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "filename pointing to the Seurat raw output object (anndata???)."
+      },
+      "Seurat_filtered": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "filename pointing to the Seurat object holding the filtered data."
+      }
+  }
+}

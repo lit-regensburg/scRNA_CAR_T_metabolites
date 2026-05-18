@@ -1,0 +1,423 @@
+---
+title: "Dimensionality Reduction"
+author: "Malte Simon and Paul Heinrich, adapted from Inma Hernandez & Nicholas Strieder"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+
+```{r date, echo=FALSE}
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+
+libload<-c("rprojroot", "jsonlite", "yaml", "Seurat", "SeuratWrappers", "ggpubr", "tidyverse", "plyr", 
+        "cowplot", "patchwork", "ggExtra","harmony", "UCell", "future", 'jj', 'viridis', 'ggpointdensity')
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+config_schema <- read_json(file.path("schema", "config.schema.json"))
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r parameters, echo=FALSE}
+
+integration_method_wrappers <- list(
+  "harmony" = HarmonyIntegration,
+  "fastMNN" = FastMNNIntegration,
+  "rpca" = RPCAIntegration,
+  "cca" = CCAIntegration,
+  "jpca" = JointPCAIntegration
+)
+
+```
+
+```{r process_config, echo=FALSE}
+
+check_integration_config(config, config_schema, analysis_dir)
+check_clustering_config(config)
+
+integrate <- config$integration$integrate
+integration_methods <- c()
+if (integrate) {integration_methods <- config$integration$methods}
+
+cluster_resolution <- as.numeric(str_extract(config$scParam$clusters, "([0-9]+\\.[0-9]+$)|([0-9]+)$"))
+
+```
+
+```{r custom functions, include=F}
+
+create_dimset_table <- function(dim_from = c(1,2), dim_to = c(10, 15, 20)) {
+  dimsets <- base::expand.grid(list("from" = dim_from, "to" = dim_to))
+  rownames(dimsets) <- apply(dimsets, 1, function(x) paste(x, collapse = "_"))
+  return(dimsets)
+}
+create_umap_names <- function(reduction = "pca", dimsets = NULL) {
+  umap_names <- sapply(rownames(dimsets), function(x) {
+    paste0("umap_", reduction, "_", dimsets[x, "from"], "_", dimsets[x, "to"])
+  })
+  return(umap_names)
+}
+create_clustering_names <- function(reduction = "pca", dimsets = NULL, resolution = NULL) {
+  clustering_names <- sapply(rownames(dimsets), function(x) {
+    paste0("RNA_snn_", reduction, ".", dimsets[x, "from"], ".", dimsets[x, "to"], "_res.", resolution)
+  })
+  return(clustering_names)
+}
+
+run_umap_on_dimsets <- function(
+  seurat_obj,
+  reduction = "pca",
+  dimsets = NULL
+) {
+  message(sprintf('Running %i UMAPs on %s reduction', nrow(dimsets), reduction))
+  umap_names <- create_umap_names(reduction = reduction, dimsets = dimsets)
+
+  for(dimsetId in rownames(dimsets)){
+    message(sprintf("Running UMAP on %s dimensions %s", reduction, str_replace(dimsetId, "_", ":")))
+
+    seurat_obj <- RunUMAP(
+      object = seurat_obj,
+      reduction = reduction,
+      dims = dimsets[dimsetId, "from"]:dimsets[dimsetId, "to"],
+      reduction.key = paste0(umap_names[dimsetId], "_"),
+      reduction.name = umap_names[dimsetId]
+    )
+  }
+  return(seurat_obj)
+}
+
+run_clustering_on_dimsets <- function(
+  seurat_obj,
+  reduction = "pca",
+  dimsets = NULL,
+  resolution = NULL
+) {
+  message(sprintf('Running %i clustering steps on %s reduction', nrow(dimsets), reduction))
+  clustering_names <- create_clustering_names(reduction = reduction, dimsets = dimsets, resolution = resolution)
+
+  for(dimsetId in rownames(dimsets)){
+    message(sprintf("Running clustering on %s dimensions %s", reduction, str_replace(dimsetId, "_", ":")))
+    seurat_obj <- FindNeighbors(object = seurat_obj, reduction = reduction, dims = dimsets[dimsetId, "from"]:dimsets[dimsetId, "to"])
+    seurat_obj <- FindClusters(object = seurat_obj, resolution = resolution, cluster.name = clustering_names[dimsetId])
+  }
+  return(seurat_obj)
+}
+
+plot_comp_x_to_y <- function(obj, reduction.name='pca', compxtoy=1:6, colBy='nCount_RNA', colorscale = viridis::scale_colour_viridis()){
+  #plot components 1:12 against each other (from pca, svd, mds...)
+  #eg: plot_comp1to12(seurat_atac, reduction.name = 'pca_all_5000_most_var', colBy = 'sample_name')
+  gg_df <-obj@reductions[[reduction.name]]@cell.embeddings[,compxtoy] %>% 
+    as.data.frame %>% rownames_to_column('id')
+  names(gg_df) <- c('id', paste0('PC_', compxtoy))
+  gg_df <- as.data.frame(cbind(gg_df, obj@meta.data))
+  gg_list <- list()
+  j=1
+  for(i in seq(min(compxtoy), max(compxtoy), by=2)){
+    if(is.null(colBy)){
+      gg_list[[j]] <- ggplot(gg_df) + geom_pointdensity(aes_string(x=sprintf('PC_%i',i), y=sprintf('PC_%i',i+1)), size = 0.5) + colorscale + theme_minimal()
+    }else{
+          gg_list[[j]] <- ggplot(gg_df) + geom_point(aes_string(x=sprintf('PC_%i',i), y=sprintf('PC_%i',i+1), colour=colBy), size = 0.5) + colorscale + theme_minimal()
+    }
+    j=j+1
+  }
+  #prime_numbers = prime_factorization(length(gg_list))
+  #nrows = sum(prime_numbers[1:ceiling(length(prime_numbers)/2)])
+  #ncols = ceiling(length(gg_list)/nrows)#sum(prime_numbers[(ceiling(length(prime_numbers)/2)+1):length(prime_numbers)])           
+  nrows= round(sqrt(length(gg_list)))
+  ncols = ceiling(length(gg_list) / nrows)
+  ggpubr::ggarrange(plotlist = gg_list, nrow=nrows, ncol=ncols, labels='', label.x = 1/4, common.legend = T) 
+}
+
+```
+
+```{r loaddata, echo=F, eval=T}
+
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_filtered))
+#if(!is.null(config$scParam$vars_to_regress)){
+#  stopifnot(regress_var %in% colnames(SObj@meta.data))
+#}
+pt_size = get_point_size(ncol(SObj))
+samples<-names(table(SObj@meta.data$sample))
+
+batch_col <- "lib"
+batch_col_label <- batch_col
+
+if (integrate) {
+  batch_info_path <- file.path(analysis_dir, config$integration$batch_info_file)
+  message('Adding batch information to SObj meta.data')
+  batch_df = suppressMessages(read_csv(batch_info_path, col_types = 'cc'))
+  stopifnot(identical(colnames(batch_df), c('orig.ident', 'batch')))
+  stopifnot(!anyNA(batch_df))
+  stopifnot(all(batch_df$orig.ident %in% SObj$sample))
+  stopifnot(all(SObj$sample %in% batch_df$orig.ident))
+  meta_df = SObj@meta.data[, !colnames(SObj@meta.data) == 'batch']
+  SObj@meta.data = meta_df %>%
+    rownames_to_column('temp_bc') %>%
+    dplyr::left_join(batch_df, by = c('sample' = 'orig.ident')) %>%
+    as.data.frame %>%
+    column_to_rownames('temp_bc')
+
+  batch_col <- "batch"
+  batch_col_label <- "Batch"
+}
+
+dimsets <- create_dimset_table(dim_from = config$scParam$PCfrom, dim_to = config$scParam$PCto)
+
+```
+
+## Normalization, variable feature detection and PCA
+
+```{r pca, include=F, message=FALSE, eval=T}
+
+SObj <- NormalizeData(SObj, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# Perform cell cycle scoring
+
+if (config$species == "homo sapiens") {
+  s.genes <- cc.genes$s.genes
+  g2m.genes <- cc.genes$g2m.genes
+} else if (config$species == "mus musculus") {
+  s.genes <- tools::toTitleCase(tolower(cc.genes$s.genes))
+  g2m.genes <- tools::toTitleCase(tolower(cc.genes$g2m.genes))
+} else {
+  stop("Supplied species not supported for cell cycle scoring")
+}
+
+cc_features <- list(
+  "S" = s.genes,
+  "G2M" = g2m.genes
+)
+
+SObj <- AddModuleScore(SObj, features = cc_features, ctrl = 100, name = 'signature_module_')
+SObj <- AddModuleScore_UCell(SObj, features = cc_features, name = "_UCellModule")
+
+if (integrate) {
+  SObj[["RNA"]] <- split(SObj[["RNA"]], f = SObj$batch)
+}
+
+SObj <- FindVariableFeatures(SObj, selection.method = "vst", nfeatures = config$scParam$VarFeat)
+
+# Scaling with cell cycle regression
+
+if (config$scParam$regress_cc) {
+  if (config$scParam$regress_cc_score == "ModuleScore") {
+    cc_vars <- paste0("signature_module_", names(cc_features))
+  } else if (config$scParam$regress_cc_score == "UCell") {
+    cc_vars <- paste0(names(cc_features), "_UCellModule")
+  } else {
+    stop("Invalid parameter provided for 'regress_cc_score'")
+  }
+
+  SObj <- ScaleData(SObj, features = VariableFeatures(SObj), vars.to.regress = cc_vars)
+} else {
+  # Scaling without cell cycle regression
+  SObj <- ScaleData(SObj, features = VariableFeatures(SObj))
+}
+
+SObj <- RunPCA(SObj, features = VariableFeatures(object = SObj), npcs = 50)
+
+SObj = run_umap_on_dimsets(
+  SObj,
+  reduction = 'pca',
+  dimsets = dimsets
+)
+
+SObj = run_clustering_on_dimsets(
+  SObj,
+  reduction = 'pca',
+  dimsets = dimsets,
+  resolution = cluster_resolution
+)
+
+```
+
+```{r plot var features, warning=F, echo = F}
+
+VariableFeaturePlot(SObj)
+
+```
+
+### Decide on which PCs to use
+
+We need to determine the primary sources of heterogeneity in the dataset and decide which or how many
+PCs we use for the subsequent analysis. 
+
+#### Elbow plot
+
+PCs before the "elbow" in the percentage explained variance explain most of the non-random variation in the dataset.
+
+```{r elbow, echo=F}
+
+ElbowPlot(SObj, ndims = 50)
+
+```
+
+#### PC scores scatterplots
+
+Plotting the PC scores against each other can help to reveal, which components capture 'noise': these will have a mostly round shape around zero.
+
+```{r PC scores scatterplots, echo=F, eval=T}
+
+#around 30 components seem to contain nonrandom variation
+plot_comp_x_to_y(SObj, compxtoy = 1:20, colBy = NULL)
+plot_comp_x_to_y(SObj, compxtoy = 21:40, colBy = NULL)
+
+```
+
+#### PC sequencing depth correlation
+
+Sometimes, clustering can be improved by omitting the first PC if it strongly correlates with sequencing depth.
+
+```{r ncount correlation, echo = F}
+
+SObj$nCount_RNA_q95 = jj::jj_cap_vals(SObj$nCount_RNA, cap_top = 'q95')
+plot_comp_x_to_y(SObj, compxtoy = 1:4, colBy = 'nCount_RNA_q95')
+SObj$nCount_RNA_q95 = NULL
+#plot_comp_x_to_y(SObj, compxtoy = 41:50, colBy = 'nCount_RNA')
+
+```
+
+```{r multiple_integration, include=F, message=FALSE, eval=T}
+
+if (integrate) {
+  for (integration_method in integration_methods) {
+    SObj <- IntegrateLayers(
+      object = SObj, method = integration_method_wrappers[[integration_method]],
+      orig.reduction = "pca", new.reduction = integration_method,
+      verbose = FALSE
+    )
+
+    SObj = run_umap_on_dimsets(
+      SObj,
+      reduction = integration_method,
+      dimsets = dimsets
+    )
+
+    SObj = run_clustering_on_dimsets(
+      SObj,
+      reduction = integration_method,
+      dimsets = dimsets,
+      resolution = cluster_resolution
+    )
+  }
+
+  SObj <- JoinLayers(SObj)
+}
+
+```
+
+## UMAP for the data set
+
+Seurat offers several non-linear dimensional reduction techniques. We chose  here UMAP to visualize the dataset.
+If integration was chosen, UMAPs of integrated data for the different methods will be shown in addition to UMAP on PC space.
+
+`r if(integrate) {paste0("Integration with methods: ", paste(integration_methods, collapse = ", "))}`
+
+```{r generate_umap_plots, message=FALSE, echo=F}
+
+reductions <- c("pca", integration_methods)
+umap_reduction_plots <- list()
+
+for (reduction in reductions) {
+  umap_reduction_plots[[reduction]] <- list()
+  umap_names <- create_umap_names(reduction = reduction, dimsets = dimsets)
+  clustering_names <- create_clustering_names(reduction = reduction, dimsets = dimsets, resolution = cluster_resolution)
+
+  for (dimsetId in rownames(dimsets)) {
+    umap_plot_batch <- jj_plot_features(
+      SObj,
+      reduction = umap_names[[dimsetId]],
+      meta_features = batch_col,
+      pt.size = pt_size,
+      do_shuffle = TRUE,
+      return_gg_object = TRUE
+    )[[1]] + theme(legend.position = "right") +
+      guides(color = guide_legend(title = batch_col_label))
+
+    umap_plot_clusters <- jj_plot_features(
+      SObj,
+      reduction = umap_names[[dimsetId]],
+      meta_features = clustering_names[[dimsetId]],
+      pt.size = pt_size,
+      do_shuffle = TRUE,
+      return_gg_object = TRUE
+    )[[1]] + theme(legend.position = "right") +
+      guides(color = guide_legend(title = paste0("Clusters\n(res ", cluster_resolution, ")")))
+
+    umap_plots_combined <- umap_plot_batch + umap_plot_clusters
+    umap_reduction_plots[[reduction]][[dimsetId]] <- umap_plots_combined
+
+    # plt_name <- paste0("umap_", reduction, "_dims_", dimsetId, ".png")
+    # ggsave(file.path(analysis_dir, config$outputpath$fig, "tmp", plt_name), height = 6, width = 12)
+  }
+}
+
+```
+
+```{r plot_umaps, results='asis', fig.dim = c(12, 6), echo = FALSE, warning = F}
+
+for (reduction in names(umap_reduction_plots)) {
+  cat(paste0("### Reduction: ", reduction, " {.tabset}"))
+  cat("\n\n")
+  for (dimset in names(umap_reduction_plots[[reduction]])) {
+    cat("#### ", dimset, "\n")
+    print(umap_reduction_plots[[reduction]][[dimset]])
+    cat("\n\n")
+  }
+}
+
+```
+
+
+```{r save data, include=F}
+#save back to Seurat filtered to avoid using too much disk space
+#config$Seurat_dimred = file.path(dirname(config$Seurat_rawall), 'SeuratObj_merged_dimred.rds')
+
+saveRDS(SObj, file=file.path(analysis_dir, config$Seurat_filtered))
+#write_yaml(config, file=params$config)
+
+```
+
+## SessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```

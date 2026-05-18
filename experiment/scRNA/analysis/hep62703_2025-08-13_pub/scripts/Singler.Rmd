@@ -1,0 +1,211 @@
+---
+title: "SingleR"
+author: "Malte Simon, custom function by Niklas Beumer"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+```{r date, echo=FALSE}
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries,include=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+libload<-c("rprojroot", "yaml","Seurat", "tidyverse", "future", "jj", "SingleR")
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo = F, message = F, warning= F, error=T}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multicore", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r default config,echo=FALSE}
+reference_dir = config$singlerRefpath
+ref_list_custom = NULL
+obj_use = 'Seurat_filtered'
+umap_use = config$scParam$dimred #paste(c('umap', config$scParam$PCdims), collapse = '_')
+fast_mode = FALSE #speed up singler predictions by summarising reference samples by their label
+```
+
+```{r custom functions, echo = F, message = F, warning= F, error=T}
+run_singler <- function(seur_obj, ref_dataset){
+  # This function applies SingleR to a Seurat object. Cells are annotated to cetagories
+  #   in the label.main slot of the reference data set.
+  # seur_obj: The Seurat object to use.
+  # ref_dataset: A SingleR reference data set.
+  # Dependencies: Seurat, testit, SingleR (The latter must be installed but need 
+  #   not be loaded)
+  # Value: The updated Seurat object.
+  # Author: Niklas Beumer
+  
+  # Convert the Seurat object to a SingleCellExperiment.
+  seur_obj_for_singler <- as.SingleCellExperiment(seur_obj, assay = "RNA")
+  #stopifnot(identical(colnames(seur_obj), colnames(seur_obj_for_singler)))
+  
+  # Run SingleR
+  singler_res <- SingleR::SingleR(test = seur_obj_for_singler,
+                                  ref = ref_dataset,
+                                  labels = ref_dataset$label.main)
+  return(singler_res)
+}
+
+get_singler_label = function(singler_res){
+  # Re-name cells that are unclassified.
+  singler_res$pruned.labels <- replace(singler_res$pruned.labels, which(is.na(singler_res$pruned.labels)), "Unclassified")
+  
+  # Append SingleR's annotations to the Seurat object.
+  #stopifnot(identical(colnames(seur_obj), rownames(singler_res)))
+  cell_type_order <- sort(unique(singler_res$pruned.labels))
+  pred_vec <- factor(singler_res$pruned.labels, levels = cell_type_order)
+  
+  # Return the updated Seurat object.
+  return(pred_vec)
+}
+
+```
+
+```{r loaddata,eval=T,echo=F}
+SObj <- readRDS(file.path(analysis_dir, config[[obj_use]] ))
+pt_size = get_point_size(ncol(SObj))
+stopifnot(umap_use %in% Reductions(SObj))
+sample_names <-names(table(SObj@meta.data$sample))
+```
+
+
+```{r get references, include = F}
+
+# Get the reference data sets.
+if (config$species == 'homo sapiens') {
+  # ref_list = list(
+  #   novershtern <- celldex::NovershternHematopoieticData(cell.ont = "all"),
+  #   blueprint <- celldex::BlueprintEncodeData(cell.ont = "all"),
+  #   hpca <- celldex::HumanPrimaryCellAtlasData(cell.ont = "all"),
+  #   dice <- celldex::DatabaseImmuneCellExpressionData(cell.ont = "all"),
+  #   monaco <- celldex::MonacoImmuneData(cell.ont = "all")
+  # )
+  ref_list = list(
+    novershtern = 'NovershternHematopoieticData.RDS',
+    blueprint = 'BlueprintEncodeData.RDS',
+    hpca = 'HumanPrimaryCellAtlasData.RDS',
+    dice = 'DatabaseImmuneCellExpressionData.RDS',
+    monaco = 'MonacoImmuneData.RDS'
+  )
+} else if (config$species == 'mus musculus') {
+  # ref_list = list(
+  #     immgen <- celldex::ImmGenData(cell.ont = "all"),
+  #     mouse_rna_seq <- celldex::MouseRNAseqData(cell.ont = "all")
+  # )
+  ref_list = list(
+      immgen = 'ImmGenData.RDS',
+      mouse_rna_seq = 'MouseRNAseqData.RDS'
+  )
+} else {
+  stop('config$species should be one of homo sapiens or mus musculus')
+}
+
+ref_list <- lapply(ref_list, function(x) file.path(reference_dir, x))
+
+if (!is.null(ref_list_custom)) {
+  ref_list <- c(ref_list, ref_list_custom)
+}
+
+message('Using the following reference datasets: ', paste(names(ref_list), collapse = ', '))
+ref_list <- lapply(ref_list, read_rds)
+
+if(fast_mode){
+  for(i in seq_along(ref_list)){
+    mean_mat = jj_summarize_sparse_mat(assays(ref_list[[i]])[[1]], ref_list[[i]]$label.main)
+    ref_list[[i]] = SummarizedExperiment(assays = list(logcounts = mean_mat), colData = data.frame(label.main=colnames(mean_mat), label.fine=colnames(mean_mat)))
+  }
+}
+```
+
+```{r run singler, include = F, message = F}
+gg = gg2 = gg3 = singler_res_list = list()
+counter = 1 
+for(i in names(ref_list)){
+  message(sprintf('%i/%i: %s', counter, length(ref_list), i))
+  # Set a seed since the processes in this code chunk involves random sampling.
+  set.seed(7)
+  
+  # Perform SingleR annotation.
+  singler_res_list[[i]] = run_singler(seur_obj = SObj, ref_dataset = ref_list[[i]])
+  SObj[[i]] <- get_singler_label(singler_res_list[[i]])
+  
+  # Generate a colour scale for the annotated cell types.
+  cell_type_order <- sort(unique(SObj@meta.data[, i]))
+  n_celltypes <- length(cell_type_order)
+  ann_col_palette <- c(sample(rainbow(n_celltypes - 1), size = n_celltypes - 1), "black")
+  names(ann_col_palette) <- cell_type_order
+  gg[[i]] = jj_plot_features(SObj, reduction = umap_use, meta_features = i, pt.size = pt_size, do_shuffle = T, return_gg_object = T)[[1]]
+  gg2[[i]] = jj_plot_features(SObj, reduction = umap_use, meta_features = i, facet_by = i, pt.size = pt_size, do_shuffle = F, use_pointdensity = T, return_gg_object = T)[[1]]
+  gg3[[i]] = jj_plot_categorical_by_group(SObj@meta.data, feature_column = i, group_column = 'sample', add_text = T)
+  counter = counter+1
+}
+```
+
+
+```{r save seurat, echo = F}
+saveRDS(SObj, file.path(analysis_dir, config[[obj_use]] ))
+```
+
+## SingleR predictions on UMAP {.tabset}
+
+For this automatic cell type annotation, we use SingleR. SingleR assesses the correlation between a cell's gene expression and reference gene expression profiles for particular cell types. There are different collections of reference profiles. Currently, we use references provided along with SingleR in the celldex package.
+
+```{r plot umap, results='asis', echo = FALSE, warning=F, fig.height=5, fig.width=8 + 2 * ceiling(length(cell_type_order) / 20) - 2}
+#fig.height=2 * ceiling(n_celltypes / 4), fig.width=12 + 4 * ceiling(length(cell_type_order) / 20) - 4}
+for (i in names(ref_list)){
+  cat("### ", i,"\n")
+  #cat('UMAP coloured by SingleR prediction')
+  print(gg[[i]] + ggtitle('UMAP coloured by SingleR prediction'))
+  #cat('SingleR label density')
+  print(gg2[[i]] + ggtitle('SingleR label density'))
+  #cat('SingleR label frequency summarized by group')
+  print(gg3[[i]] + ggtitle('SingleR label frequency summarized by group'))
+  #cat('SingleR prediction scores')
+  print(SingleR::plotScoreHeatmap(singler_res_list[[i]], main = 'SingleR prediction scores'))
+  #cat('SingleR delta distribution')
+  print(SingleR::plotDeltaDistribution(singler_res_list[[i]]) + ggtitle('SingleR delta distribution'))
+  cat('\n\n')
+}
+```
+
+## SessionInfo()
+
+```{r sessionInfo,echo=T}
+sessionInfo()
+```

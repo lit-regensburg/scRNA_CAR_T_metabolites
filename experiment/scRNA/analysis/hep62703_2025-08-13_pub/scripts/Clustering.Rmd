@@ -1,0 +1,214 @@
+---
+title: "Clustering"
+author: "Malte Simon, adapted from Inma Hernandez & Nicholas Strieder"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+
+```{r date, echo=FALSE}
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+
+libload<-c("rprojroot", "yaml", "Seurat","ggpubr","tidyverse","plyr",
+           "cowplot","ggExtra",  "future", 'jj', 'viridis', 'ggpointdensity', 'clustree')
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r process_config, echo=FALSE}
+
+check_clustering_config(config)
+cluster_on <- get_clustering_dimred(config)
+umap_use <- config$scParam$dimred
+
+```
+
+```{r custom functions, include=F}
+
+clusterCells <- function(seurat_obj, reduction='pca', dims=1:20, resolution=0.5, ...) {
+  seurat_obj <- FindNeighbors(object = seurat_obj, reduction = reduction, dims = dims, ...)
+  seurat_obj <- FindClusters(object = seurat_obj, resolution = resolution, ...)
+  return(seurat_obj)
+}
+
+```
+
+
+```{r loaddata,eval=T,echo=F}
+
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_filtered))
+pt_size = get_point_size(ncol(SObj))
+samples<-names(table(SObj@meta.data$sample))
+SObj[["umap"]] <- CreateDimReducObject(embeddings = Embeddings(SObj[[umap_use]]), key = "umap_", assay = "RNA")
+
+```
+
+## Meta data UMAP plots {.tabset}
+
+Using `r umap_use` for further analyses.
+
+```{r generate metadata umap plots, echo=F, message=F}
+gg = list()
+gg[['Sample']] = jj_plot_features(SObj, reduction = umap_use, meta_features = 'sample', my_title = umap_use, return_gg_object = T, pt.size = pt_size, do_shuffle = T)
+gg[['Sample density']] = jj_plot_features(SObj, reduction = umap_use, meta_features = c('sample'), facet_by = 'sample', use_pointdensity = T, pt.size = pt_size, do_shuffle = F, show_background_cells = T, return_gg_object = T)
+if('hash.ID' %in% colnames(SObj@meta.data)){
+  gg[['Hash IDs']] = jj_plot_features(SObj, reduction = umap_use, pt.size = pt_size, do_shuffle = T, meta_features = c('hash.ID'), return_gg_object = T)
+  gg[['Hash ID density']] = jj_plot_features(SObj, reduction = umap_use, meta_features = c('hash.ID'), facet_by = 'hash.ID', use_pointdensity = T, pt.size = pt_size, do_shuffle = F, show_background_cells = T, return_gg_object = T)
+}
+if('group' %in% colnames(SObj@meta.data)){
+  gg[['group']] = jj_plot_features(SObj, reduction = umap_use, pt.size = pt_size, do_shuffle = T, meta_features = c('group'), return_gg_object = T)
+}
+if(('scDblFinder.class' %in% colnames(SObj@meta.data)) && (length(unique(SObj$scDblFinder.class)) > 1 )){
+    gg[['Doublet class']] = jj_plot_features(SObj, reduction =umap_use, meta_features = 'scDblFinder.class', use_pointdensity = T, pt.size = pt_size, do_shuffle = F, facet_by = 'scDblFinder.class', facet_subset = 'doublet', show_background_cells = T, return_gg_object = T)[[1]] 
+}
+if('scDblFinder.score' %in% colnames(SObj@meta.data)){
+   gg[['Doublet score']] = jj_plot_features(SObj, pt.size = pt_size, do_shuffle = T, reduction = umap_use, meta_features = 'scDblFinder.score', return_gg_object = T)[[1]] 
+}
+```
+
+```{r plot metadata umap plots, results='asis', echo = FALSE, warning = F}
+for (i in 1:length(gg)){
+  cat("### ", names(gg)[i],"\n")
+    print(gg[[i]])
+  cat('\n\n')
+}
+```
+
+## Cell cycle scoring {.tabset}
+
+Predict cell cycle phase based on expression of S and G2M phase marker genes.
+
+```{r cell cycle, echo = F, message=F}
+s.genes <- tools::toTitleCase(tolower(cc.genes$s.genes))
+g2m.genes <- tools::toTitleCase(tolower(cc.genes$g2m.genes))
+SObj <- CellCycleScoring(SObj, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+table(SObj$Phase)
+Phase_smooth = suppressMessages(jj_summarize_nearest_neighbour_data(dr_df = SObj@meta.data[, c('Phase', 'sample')],reduction_df = jj_get_reduction_coords(SObj, umap_use)[, 1:2], k = 20))
+SObj$Phase_smooth = Phase_smooth$Phase
+
+gg = list()
+gg[['Absolute classification']] = jj_plot_categorical_by_group(SObj@meta.data, feature_column = 'Phase_smooth', group_column = 'sample', add_text = T, flip_coordinates = T, absolute_numbers = T)
+gg[['Relative classification']] = jj_plot_categorical_by_group(SObj@meta.data, feature_column = 'Phase_smooth', group_column = 'sample', add_text = T, flip_coordinates = T)
+gg[['Phase']] = jj_plot_features(SObj, reduction = umap_use,  meta_features = c('Phase'), pt.size = pt_size, do_shuffle = T, return_gg_object = T)[[1]]
+gg[['Phase_smooth']] = jj_plot_features(SObj, reduction = umap_use,  meta_features = c('Phase_smooth'), pt.size = pt_size, do_shuffle = T, return_gg_object = T)[[1]]
+gg[['S.Score']] = jj_plot_features(SObj, reduction = umap_use,  meta_features = c('S.Score'), cap_top = 'auto', pt.size = pt_size, do_shuffle = T, return_gg_object = T)[[1]]
+gg[['G2M.Score']] = jj_plot_features(SObj, reduction = umap_use,  meta_features = c('G2M.Score'), pt.size = pt_size, do_shuffle = T, cap_top = 'auto', return_gg_object = T)[[1]]
+```
+
+```{r cell cycle plots, results='asis', echo = FALSE, warning = F}
+for (i in 1:length(gg)){
+  cat("### ", names(gg)[i],"\n")
+    print(gg[[i]])
+  cat('\n\n')
+}
+```
+
+## Graph-based clustering
+
+```{r graph-based clustering, echo =F, message=F, warning=F, fig.width=12, fig.height=10}
+
+cluster_res_additional <- config$scParam$cluster_res
+
+cluster_res_default <- as.character(seq(0.2, 2, 0.2))
+cluster_res <- as.numeric(cluster_res_default)
+
+if (!is.null(cluster_res_additional)) {
+  cluster_res_additional <- as.character(cluster_res_additional)
+  cluster_res_additional <- cluster_res_additional[!(cluster_res_additional %in% cluster_res_default)]
+
+  if (length(cluster_res_additional)) {
+    cluster_res <- sort(as.numeric(c(cluster_res_default, cluster_res_additional)))
+  } else {
+    cluster_res_additional <- NULL
+  }
+}
+
+res_min <- min(cluster_res)
+res_max <- max(cluster_res)
+
+print(paste0("Calculating graph-based clusters for resolution ", res_min, " - ", res_max, " based on ", config$scParam$cluster_on))
+
+if (!is.null(cluster_res_additional)) {
+  print(paste0("Additional resolutions: ", paste(cluster_res_additional, collapse = ", ")))
+}
+
+SObj = clusterCells(
+  SObj, reduction = cluster_on[1],
+  dims = as.integer(cluster_on[2]):as.integer(cluster_on[3]),
+  resolution = cluster_res, verbose = FALSE
+)
+
+resolutions <- paste0("RNA_snn_res.", cluster_res)
+gg = jj_plot_features(SObj, reduction = umap_use, meta_features=resolutions, cont_or_disc = 'd', pt.size = pt_size, do_shuffle = T, return_gg_object = T)
+names(gg) = resolutions
+
+clustree(SObj@meta.data, prefix = "RNA_snn_res.")
+
+```
+
+## Cluster UMAP plots {.tabset}
+
+```{r plot cluster umap plots, results='asis', echo = FALSE, warning = F}
+
+for (i in 1:length(gg)){
+  cat("### ", names(gg)[i],"\n")
+  print(gg[[i]])
+  cat('\n\n')
+}
+
+```
+
+```{r save data, include=F}
+#save back to Seurat filtered to avoid using too much disk space
+#config$Seurat_dimred = file.path(dirname(config$Seurat_rawall), 'SeuratObj_merged_dimred.rds')
+saveRDS(SObj, file=file.path(analysis_dir, config$Seurat_filtered))
+#write_yaml(config,file=params$config)  
+```
+
+
+## SessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```

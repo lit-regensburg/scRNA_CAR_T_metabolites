@@ -1,0 +1,256 @@
+---
+title: "Assessment of Azimuth annotation"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+# Notes
+
+```{r chunk_settings, echo=FALSE}
+
+knitr::opts_chunk$set(fig.dim = c(10, 10))
+
+```
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "ggplot2", "knitr", "yaml", "scales", "viridis", "patchwork", "ggrastr")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+```
+
+```{r analysis_params, eval=T ,echo=F}
+
+clusterCol <- config$scParam$clusters
+
+```
+
+```{r load_data, eval=T ,echo=F}
+
+SObj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+```
+
+# Clustering
+
+```{r clustering_plots, eval=T, echo=F, fig.dim = c(9, 7)}
+
+DimPlot(SObj, group.by = clusterCol, reduction = config$scParam$dimred)
+
+```
+
+# Azimuth annotation level 1
+
+```{r azimuth_plots_L1, eval=T, echo=F, fig.dim = c(9, 7)}
+
+kable(table(SObj[[]][["predicted.celltype.l1"]], SObj[[]][[clusterCol]]))
+
+DimPlot(SObj, group.by = "predicted.celltype.l1", reduction = config$scParam$dimred)
+
+```
+
+# Azimuth annotation level 2
+
+```{r azimuth_plots_L2, eval=T, echo=F, fig.dim = c(9, 7)}
+
+kable(table(SObj[[]][["predicted.celltype.l2"]], SObj[[]][[clusterCol]]))
+
+DimPlot(SObj, group.by = "predicted.celltype.l2", reduction = config$scParam$dimred)
+
+celltypeMappingL2_A <- sort(unique(SObj[[]][["predicted.celltype.l2"]]))
+names(celltypeMappingL2_A) <- celltypeMappingL2_A
+
+celltypeMappingL2_A[!grepl("^CD8|^CD4", celltypeMappingL2_A)] <- "Other"
+celltypeMappingL2_A[grepl("^CD8", celltypeMappingL2_A)] <- "CD8"
+
+SObj[[]][["predicted.celltype.l2_simple_A"]] <- sapply(
+    SObj[[]][["predicted.celltype.l2"]],
+    function(x) celltypeMappingL2_A[x]
+)
+
+umapL2_A <- DimPlot(SObj, group.by = "predicted.celltype.l2_simple_A", reduction = config$scParam$dimred)
+umapL2_A
+
+celltypeMappingL2_B <- celltypeMappingL2_A
+
+celltypeMappingL2_B["Treg"] <- "Treg"
+celltypeMappingL2_B["dnT"] <- "dnT"
+celltypeMappingL2_B["gdT"] <- "gdT"
+celltypeMappingL2_B["MAIT"] <- "MAIT"
+celltypeMappingL2_B["NK Proliferating"] <- "NK Proliferating"
+
+SObj[[]][["predicted.celltype.l2_simple_B"]] <- sapply(
+    SObj[[]][["predicted.celltype.l2"]],
+    function(x) celltypeMappingL2_B[x]
+)
+
+umapL2_B <- DimPlot(SObj, group.by = "predicted.celltype.l2_simple_B", reduction = config$scParam$dimred)
+umapL2_B
+
+celltypeMappingL2_C <- celltypeMappingL2_A
+
+celltypeMappingL2_C[grepl("^CD8", celltypeMappingL2_C)] <- names(celltypeMappingL2_C[grepl("^CD8", celltypeMappingL2_C)])
+
+SObj[[]][["predicted.celltype.l2_simple_C"]] <- sapply(
+    SObj[[]][["predicted.celltype.l2"]],
+    function(x) celltypeMappingL2_C[x]
+)
+
+umapL2_C <- DimPlot(SObj, group.by = "predicted.celltype.l2_simple_C", reduction = config$scParam$dimred)
+umapL2_C
+
+celltypeMappingL2_NK <- celltypeMappingL2_A
+
+celltypeMappingL2_NK["NK Proliferating"] <- "NK Proliferating"
+
+SObj[[]][["predicted.celltype.l2_simple_NK"]] <- sapply(
+    SObj[[]][["predicted.celltype.l2"]],
+    function(x) celltypeMappingL2_NK[x]
+)
+
+umapL2_NK <- DimPlot(SObj, group.by = "predicted.celltype.l2_simple_NK", reduction = config$scParam$dimred)
+umapL2_NK
+
+celltypeMappingL2_NK_DN <- celltypeMappingL2_A
+
+celltypeMappingL2_NK_DN["NK Proliferating"] <- "NK Proliferating"
+celltypeMappingL2_NK_DN["dnT"] <- "dnT"
+celltypeMappingL2_NK_DN["CD4 Naive"] <- "Other"
+
+SObj[[]][["predicted.celltype.l2_simple_NK_DN"]] <- sapply(
+    SObj[[]][["predicted.celltype.l2"]],
+    function(x) celltypeMappingL2_NK_DN[x]
+)
+
+umapL2_NK_DN <- DimPlot(SObj, group.by = "predicted.celltype.l2_simple_NK_DN", reduction = config$scParam$dimred)
+umapL2_NK_DN
+
+celltypeMappingL2_CD8 <- celltypeMappingL2_A
+
+celltypeMappingL2_CD8[grepl("^CD8", celltypeMappingL2_CD8)] <- names(celltypeMappingL2_CD8[grepl("^CD8", celltypeMappingL2_CD8)])
+celltypeMappingL2_CD8[grepl("^CD4", celltypeMappingL2_CD8)] <- "CD4"
+
+SObj[[]][["predicted.celltype.l2_simple_CD8"]] <- sapply(
+    SObj[[]][["predicted.celltype.l2"]],
+    function(x) celltypeMappingL2_CD8[x]
+)
+
+celltypesCelltypeMappingL2_CD8 <- sort(unique(SObj[[]][["predicted.celltype.l2_simple_CD8"]]))
+colorsCelltypeMappingL2_CD8 <- pal_hue()(length(celltypesCelltypeMappingL2_CD8))
+names(colorsCelltypeMappingL2_CD8) <- celltypesCelltypeMappingL2_CD8
+colorsCelltypeMappingL2_CD8["CD4"] <- "grey"
+
+umapL2_CD8 <- DimPlot(SObj, group.by = "predicted.celltype.l2_simple_CD8", reduction = config$scParam$dimred, cols = colorsCelltypeMappingL2_CD8)
+umapL2_CD8
+
+```
+
+# Azimuth annotation level 3
+
+```{r azimuth_plots_L3_orig, eval=T, echo=F, fig.dim = c(11, 7)}
+
+kable(table(SObj[[]][["predicted.celltype.l3"]], SObj[[]][[clusterCol]]))
+
+DimPlot(SObj, group.by = "predicted.celltype.l3", reduction = config$scParam$dimred)
+
+```
+
+```{r azimuth_plots_L3, eval=T, echo=F, fig.dim = c(9, 7)}
+
+celltypeMappingL3_A <- sort(unique(SObj[[]][["predicted.celltype.l3"]]))
+names(celltypeMappingL3_A) <- celltypeMappingL3_A
+
+celltypeMappingL3_A[!grepl("^CD8|^CD4", celltypeMappingL3_A)] <- "Other"
+celltypeMappingL3_A[grepl("^CD8", celltypeMappingL3_A)] <- "CD8"
+
+SObj[[]][["predicted.celltype.l3_simple_A"]] <- sapply(
+    SObj[[]][["predicted.celltype.l3"]],
+    function(x) celltypeMappingL3_A[x]
+)
+
+umapL3_A <- DimPlot(SObj, group.by = "predicted.celltype.l3_simple_A", reduction = config$scParam$dimred)
+umapL3_A
+
+celltypeMappingL3_CD4_TCM <- celltypeMappingL3_A
+
+celltypeMappingL3_CD4_TCM[!grepl("^CD4 TCM", celltypeMappingL3_CD4_TCM)] <- "Other"
+
+SObj[[]][["predicted.celltype.l3_simple_CD4_TCM"]] <- sapply(
+    SObj[[]][["predicted.celltype.l3"]],
+    function(x) celltypeMappingL3_CD4_TCM[x]
+)
+
+umapL3_CD4_TCM <- DimPlot(SObj, group.by = "predicted.celltype.l3_simple_CD4_TCM", reduction = config$scParam$dimred)
+umapL3_CD4_TCM
+
+```
+
+```{r save_plots, eval=F, echo=F}
+
+plotPath <- file.path(analysis_dir, config$outputpath$fig, "azimuth")
+plotFileType <- "pdf"
+
+ggsave(
+    file.path(plotPath, paste0("umap_azimuth_L2_simple_A.", plotFileType)),
+    rasterize(umapL2_A, layer = "point", dpi = 300) + labs(title = "Azimuth annotation L2, simplified", x = "UMAP 1", y = "UMAP 2"),
+    width = 9, height = 7
+)
+
+ggsave(
+    file.path(plotPath, paste0("umap_azimuth_L2_simple_NK.", plotFileType)),
+    rasterize(umapL2_NK, layer = "point", dpi = 300) + labs(title = "Azimuth annotation L2, simplified, with 'NK'", x = "UMAP 1", y = "UMAP 2"),
+    width = 9, height = 7
+)
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

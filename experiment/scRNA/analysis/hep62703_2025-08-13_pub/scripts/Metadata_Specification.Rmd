@@ -1,0 +1,283 @@
+---
+title: "Metadata specification"
+author: "Paul Heinrich, adapted from Malte Simon and Nicholas Strieder"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# libraries
+
+libload <- c("Seurat", "tidyverse", "knitr", "yaml")
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, error=T}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+data_dir <- root_directories[["data"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multicore", workers = 6)
+#plan()
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r custom functions, error=T}
+
+varsequal = function(var1,var2) {
+  #1. check length
+  var1 = unique(var1)
+  var2 = unique(var2)
+
+  if (length(var1) != length(var2)) {
+    warning("variable length is different")
+    message(paste("variable1: ",paste(var1,collapse = ","),sep = ""))
+    message(paste("variable2: ",paste(var2,collapse = ","),sep = ""))
+    return(FALSE)
+  } else {
+    if (any(!sort(var1) == sort(var2))) {
+      indx1 = which(!var1 %in% var2)
+      indx2 = which(!var2 %in% var1)
+      
+      if (length(indx1) > 0) {
+        message(paste(
+          "variable 1 contains in addition element: ",
+          paste(var1[indx1], collapse=","),
+          sep = ""
+        ))
+      }
+      if (length(indx2) > 0) {
+        message(paste(
+          "variable 2 contains in addition element: ",
+          paste(var2[indx2], collapse=","),
+          sep = ""
+        ))
+      }
+      return(FALSE)
+    } else {
+      return(TRUE)
+    }
+  }
+}
+
+```
+
+```{r loaddata, message = TRUE, warning=TRUE}
+
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_rawall))
+
+```
+
+```{r metadata_specification_basic, message=TRUE, warning=TRUE}
+
+# TODO
+
+# -Move metadata spec handling to separate script, this will also separate Seurat object filtering from
+#  metadata spec and neccessitate reworking variable checks. Also add to Snakefile 
+# -Update config schema
+# -Add more report output to metadata spec script
+# -Check correctness of library names with find_input_files() function (tweak function output to give also raw names),
+# but probably rather an issue of its own
+# -Test the various cases
+
+# We always want ot have a definition of the columns sample, group and lib
+
+# lib should represent the library
+# sample should represent the individual samples
+# group should represent treatment group/condition, tissue etc.
+
+# Case 1: No hashing, no additional file information. Each library corresponds to a sample
+
+# Initially, everything will be set to the library (orig.ident). In this case,
+# it is not possible to automatically infer the group, as there is no default
+# information on the grouping of libraries by conditions. This information must be
+# supplied explicitly via file
+
+SObj$lib <- SObj$orig.ident
+SObj$sample <- SObj$lib
+SObj$group <- SObj$lib
+
+# Case 2: Hashing without additional file information
+
+# In this case, the hash-group mapping supplied to the Cellranger pipeline will be used
+# to infer group. hash ID means the same for all libraries, and sample is the combination
+# of lib and group
+
+if (config$cellhash) {
+  message("Creating sample variable from library and hash ID")
+
+  # Transfer hash assigment information
+  # There can be libraries without hashing, these will just hold the library name as the group
+
+  hasHashId <- !is.na(SObj$hash.ID)
+  SObj$group[hasHashId] <- SObj$hash.ID[hasHashId]
+} else if (config$on_chip_multiplexing) {
+  origIdentSplit <- t(sapply(SObj$orig.ident, function(x) stringr::str_split(x, "--", simplify = TRUE)))
+  SObj$lib <- origIdentSplit[, 1]
+  SObj$group <- origIdentSplit[, 2]
+}
+
+# Setting sample
+
+if (config$cellhash || config$on_chip_multiplexing) {
+
+  libVec <- SObj$lib
+  groupVec <- SObj$group
+
+  # Shorten library and group names for setting sample name, but make sure that they remain unique
+
+  if (config$metadata_spec$shorten_sample_names) {
+    ncharTarget <- config$metadata_spec$n_char_shortened
+
+    if (is.null(ncharTarget)) {
+      ncharTarget <- 8
+    }
+
+    libVec <- shorten_names_unique(SObj$lib, nchar_start = ncharTarget)
+    groupVec <- shorten_names_unique(SObj$group, nchar_start = ncharTarget)
+  }
+
+  if (length(unique(SObj$lib)) == 1) {
+    SObj$sample <- SObj$group
+  } else {
+    SObj$sample <- paste0(libVec, ".", groupVec)
+
+    if (config$cellhash) {
+      SObj$sample[!hasHashId] <- SObj$lib[!hasHashId]
+    }
+  }
+}
+
+```
+
+```{r metadata_specification_file, message=TRUE, warning=TRUE }
+
+# Case 3: No Hashing, but additional metadata information
+
+# In this case, the group mapping of the individual libraries (i.e., samples) can
+# be supplied via file. The file can also be used to supply additional metadata columns
+
+if (!is.null(config$metadata_spec$metadata_spec_file)) {
+  metadataSpec <- read_csv(file.path(analysis_dir, config$metadata_spec$metadata_spec_file), col_types = "c")
+  metadataSpec <- metadataSpec %>% mutate(library_name=str_replace(library_name,"_scGEX",""))
+
+  # Checks library_name values match values of lib column of Seurat object
+  if (!varsequal(SObj$lib, metadataSpec$library_name)) {
+      metadataSpec$library_name <- gsub("_", "-", metadataSpec$library_name)
+      metadataSpec$library_name <- strtrim(metadataSpec$library_name, 20)
+      if (!varsequal(SObj$lib, metadataSpec$library_name)) {
+        stop("library_name does not match Seurat object libraries")
+      } else {
+        message("Differences in library_name column could be resolved")
+    }
+  }
+
+  joinSpec <- c("lib" = "library_name")
+
+  # Case 4: Hashing with additional metadata information
+
+  # This is intended for cases where the hash ID corresponds to a different group
+  # depending on the library. The mapping is supplied manually via metadata file
+
+  if (config$cellhash) {
+    message(paste0("Renaming library hash combinations according to: ", config$metadata_spec$metadata_spec_file))
+
+    isDoubletNegative <- SObj$group %in% c("Negative", "Doublet")
+    hashIDsSeurat <- unique(SObj$group[!isDoubletNegative])
+
+    # Check if hashes are there
+    if (!varsequal(metadataSpec$hash_marker, hashIDsSeurat)) {
+      metadataSpec$hash_marker <- gsub("_", "-", metadataSpec$hash_marker)
+      if (!varsequal(metadataSpec$hash_marker, hashIDsSeurat)) {
+        stop(paste0(
+          "Hashes do not match, here are available ",
+          "names for the hash_marker column: ",
+          paste(sort(hashIDsSeurat), collapse = ",")
+        ))
+      } else {
+        message("Differences in hash_marker column could be resolved")
+      }
+    }
+
+    joinSpec <- c(joinSpec, "group" = "hash_marker")
+  }
+
+  metadataUpdated <- left_join(
+    SObj[[]],
+    metadataSpec,
+    by = joinSpec,
+    suffix = c(".orig", ""),
+    keep = TRUE
+  )
+  rownames(metadataUpdated) <- rownames(SObj[[]])
+
+  # For the default columns, transfer data of Negative and Doublet cells back
+  # from original columns after join, so it is not NA
+
+  if (config$cellhash) {
+    defaultCols <- c("lib", "sample", "group")
+    defaultColsJoined <- defaultCols[defaultCols %in% colnames(metadataSpec)]
+    metadataUpdated[isDoubletNegative, defaultColsJoined] <- SObj[[]][isDoubletNegative, defaultColsJoined]
+  }
+
+  SObj <- AddMetaData(SObj, metadata = metadataUpdated)
+}
+
+```
+
+# Sample-group table after metadata specification
+
+```{r sample_group_table, message = TRUE, warning=TRUE}
+
+kable(table(SObj$sample, SObj$group))
+
+```
+
+```{r save_data }
+
+saveRDS(SObj, file = file.path(analysis_dir, config$Seurat_rawall))
+
+```
+
+## SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```

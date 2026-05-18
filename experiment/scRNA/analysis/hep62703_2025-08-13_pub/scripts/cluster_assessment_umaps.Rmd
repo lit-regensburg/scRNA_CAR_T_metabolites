@@ -1,0 +1,360 @@
+---
+title: "Cluster and annotation assessment via UMAP plots"
+subtitle: "scRNA-seq of metabolite-treated T-cells"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+# Notes
+
+```{r chunk_settings, echo=FALSE}
+
+knitr::opts_chunk$set(fig.dim = c(10, 10))
+
+```
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "ggplot2", "knitr", "yaml", "scales", "viridis", "patchwork", "ggrastr")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+```
+
+```{r analysis_params, eval=T ,echo=F}
+
+annotation_key <- "annotation_T-cell-subtypes"
+
+clusterCol <- config$scParam$clusters
+annotCol <- config[[annotation_key]]$annotation_col
+condCol <- "group"
+libCol <- "lib"
+
+```
+
+```{r load_data, eval=T ,echo=F}
+
+SObj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+```
+
+```{r split_seurat_object, eval=T ,echo=F}
+
+SObj_split <- SplitObject(SObj, split.by = condCol)
+
+```
+
+# UMAP plots of annotation and clusters
+
+## UMAP by annotation
+
+```{r umap_annots, eval=T, echo=F, fig.dim = c(8, 7)}
+
+umap_annot <- DimPlot(SObj, group.by = annotCol, reduction = config$scParam$dimred)
+
+umap_annot
+
+```
+
+## UMAP by annotation and condition
+
+```{r umap_annots_cond, eval=T, echo=F, fig.dim = c(12, 12)}
+
+umap_annot_cond <- DimPlot(SObj, group.by = annotCol, split.by = condCol, reduction = config$scParam$dimred, ncol = 2)
+
+umap_annot_cond
+
+```
+
+## UMAP by annotation and library
+
+```{r umap_annots_lib, eval=T, echo=F, fig.dim = c(12, 12)}
+
+umap_annot_lib <- DimPlot(SObj, group.by = annotCol, split.by = libCol, reduction = config$scParam$dimred, ncol = 2)
+
+umap_annot_lib
+
+```
+
+## UMAP by annotation and condition, separate libraries {.tabset}
+
+```{r umap_annots_cond_lib, eval=T, echo=F, results='asis', fig.dim = c(12, 12)}
+
+umap_annot_cond_lib <- list()
+
+for (cond in names(SObj_split)) {
+    umap_annot_cond_lib[[cond]] <- DimPlot(
+        SObj_split[[cond]],
+        group.by = annotCol, split.by = libCol,
+        reduction = config$scParam$dimred, ncol = 2
+    )
+
+    cat("### ", cond, "\n")
+    print(umap_annot_cond_lib[[cond]])
+    cat("\n\n")
+}
+
+```
+
+## UMAP by clusters
+
+```{r umap_clusters, eval=T, echo=F, fig.dim = c(8, 7)}
+
+umap_clusters <- DimPlot(SObj, group.by = clusterCol, reduction = config$scParam$dimred)
+
+umap_clusters
+
+```
+
+## UMAP by clusters and condition
+
+```{r umap_clusters_cond, eval=T, echo=F, fig.dim = c(12, 12)}
+
+umap_clusters_cond <- DimPlot(SObj, group.by = clusterCol, split.by = condCol, reduction = config$scParam$dimred, ncol = 2)
+
+umap_clusters_cond
+
+```
+
+## UMAP by clusters and library
+
+```{r umap_clusters_lib, eval=T, echo=F, fig.dim = c(12, 12)}
+
+umap_clusters_lib <- DimPlot(SObj, group.by = clusterCol, split.by = libCol, reduction = config$scParam$dimred, ncol = 2)
+
+umap_clusters_lib
+
+```
+
+## UMAP by clustering and condition, separate libraries {.tabset}
+
+```{r umap_clusters_cond_lib, eval=T, echo=F, results='asis', fig.dim = c(12, 12)}
+
+umap_clusters_cond_lib <- list()
+
+for (cond in names(SObj_split)) {
+    umap_clusters_cond_lib[[cond]] <- DimPlot(
+        SObj_split[[cond]],
+        group.by = clusterCol, split.by = libCol,
+        reduction = config$scParam$dimred, ncol = 2
+    )
+
+    cat("### ", cond, "\n")
+    print(umap_clusters_cond_lib[[cond]])
+    cat("\n\n")
+}
+
+```
+
+# QC UMAP plots
+
+## Counts, features percent mitochondrial/ribo
+
+```{r QC_counts, eval=T, echo=F, fig.dim = c(12, 9)}
+
+qc_features <- c(
+    "nCount_RNA",
+    "nFeature_RNA",
+    "percent.mt",
+    "percent.ribo"
+)
+
+umap_qc <- list()
+
+for (feature in qc_features) {
+    umap_qc[[feature]] <- FeaturePlot(
+        SObj, features = feature,
+        reduction = config$scParam$dimred
+    ) + scale_color_viridis()
+}
+
+umap_qc_combined <- wrap_plots(umap_qc)
+
+umap_qc_combined
+
+```
+
+## Cell cycle
+
+```{r QC_cell_cycle_1, eval=T, echo=F, fig.dim = c(12, 9)}
+
+cc_features <- c(
+    "S.Score",
+    "G2M.Score",
+    "S_UCellModule",
+    "G2M_UCellModule"
+)
+
+umap_cc <- list()
+
+for (feature in cc_features) {
+    umap_cc[[feature]] <- FeaturePlot(
+        SObj, features = feature,
+        reduction = config$scParam$dimred
+    ) + scale_color_viridis()
+}
+
+umap_cc_combined <- wrap_plots(umap_cc)
+
+umap_cc_combined
+
+```
+
+```{r QC_cell_cycle_2, eval=T, echo=F, fig.dim = c(12, 5)}
+
+umap_phase <- DimPlot(
+    SObj, group.by = "Phase", reduction = config$scParam$dimred
+)
+
+umap_phase_smooth <- DimPlot(
+    SObj, group.by = "Phase_smooth", reduction = config$scParam$dimred
+)
+
+umap_phase_with_smooth <- wrap_plots(umap_phase, umap_phase_smooth, ncol = 2)
+
+umap_phase_with_smooth
+
+```
+
+## Computational doublets
+
+```{r QC_comp_doublets, eval=T, echo=F, fig.dim = c(12, 5)}
+
+umap_doublet_class <- DimPlot(
+    SObj, group.by = "scDblFinder.class", reduction = config$scParam$dimred
+)
+
+umap_doublet_score <- FeaturePlot(
+    SObj, features = "scDblFinder.score", reduction = config$scParam$dimred
+)
+
+umap_doublets <- wrap_plots(umap_doublet_class, umap_doublet_score, ncol = 2)
+
+umap_doublets
+
+```
+
+## Signal-to-noise
+
+Signal-to-noise ratio based on principal components
+
+```{r QC_signal_to_noise, eval=T, echo=F, fig.dim = c(12, 5)}
+
+pca_data <- t(Embeddings(SObj, reduction="pca"))
+
+SObj[[]]$signal_to_noise_PCA_10 <- apply(pca_data, 2, function(x) sum(abs(x[1:10]))/sum(abs(x[11:50])))
+SObj[[]]$signal_to_noise_PCA_20 <- apply(pca_data, 2, function(x) sum(abs(x[1:20]))/sum(abs(x[21:50])))
+
+umap_signal_to_noise_10 <- FeaturePlot(
+    SObj, features = "signal_to_noise_PCA_10",
+    reduction = config$scParam$dimred
+) + scale_color_viridis()
+
+umap_signal_to_noise_20 <- FeaturePlot(
+    SObj, features = "signal_to_noise_PCA_20",
+    reduction = config$scParam$dimred
+) + scale_color_viridis()
+
+umap_signal_to_noise <- wrap_plots(umap_signal_to_noise_10, umap_signal_to_noise_20, ncol = 2)
+
+umap_signal_to_noise
+
+```
+
+```{r save_plots, eval=F, echo=F}
+
+plotPathBase <- file.path(analysis_dir, config$outputpath$fig)
+plotFileType <- "pdf"
+
+ggsave(
+    file.path(plotPathBase, "umap_clusters", paste0("umap_clusters.", plotFileType)),
+    rasterize(umap_clusters, layer = "point", dpi = 300) + labs(x = "UMAP 1", y = "UMAP 2"),
+    width = 9, height = 8
+)
+
+ggsave(
+    file.path(plotPathBase, "umap_clusters", paste0("umap_clusters_cond.", plotFileType)),
+    rasterize(umap_clusters_cond, layer = "point", dpi = 300) + labs(x = "UMAP 1", y = "UMAP 2"), width = 12, height = 12
+)
+
+ggsave(
+    file.path(analysis_dir, config$outputpath$fig, "interactive", "umap_annot_lib.png"),
+    umap_annot_lib, width = 12, height = 7
+)
+
+ggsave(
+    file.path(analysis_dir, config$outputpath$fig, "interactive", "umap_clusters_cond.png"),
+    umap_clusters_cond, width = 12, height = 10
+)
+
+ggsave(
+    file.path(analysis_dir, config$outputpath$fig, "interactive", "umap_clusters_lib.png"),
+    umap_clusters_lib, width = 12, height = 7
+)
+
+ggsave(
+    file.path(analysis_dir, config$outputpath$fig, "interactive", "umap_annot.png"),
+    umap_annot, width = 10, height = 7
+)
+
+ggsave(
+    file.path(analysis_dir, config$outputpath$fig, "interactive", "umap_clusters.png"),
+    umap_clusters, width = 8, height = 7
+)
+
+ggsave(
+    file.path(analysis_dir, config$outputpath$fig, "interactive", "umap_phase.png"),
+    umap_phase_with_smooth, width = 12, height = 5
+)
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

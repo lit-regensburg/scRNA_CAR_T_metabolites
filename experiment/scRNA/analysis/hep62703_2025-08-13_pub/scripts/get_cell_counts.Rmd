@@ -1,0 +1,116 @@
+---
+title: "Get cell counts across identities, conditions and libraries"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+# Notes
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "tidyr", "yaml", "knitr")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r load_data,eval=T,echo=F}
+
+identCol <- "annot_T_cell_subtypes"
+SObj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+```
+
+```{r get_cell_counts, eval=T, echo=F, results='asis'}
+
+metadata <- SObj[[]]
+
+idents <- levels(metadata[[identCol]])
+
+# We could provide the option to run on a subset of idents via config
+
+relevantIdents <- idents
+
+countsLong <- metadata %>%
+    dplyr::count(group, lib, .data[[identCol]]) %>%
+    dplyr::rename(ident = .data[[identCol]]) %>%
+    filter(ident %in% relevantIdents) %>%
+    mutate(sample = paste0(group, "_", lib))
+
+countsLong <- countsLong %>%
+    mutate(ident = factor(ident, levels = relevantIdents)) %>%
+    arrange(group, lib, ident)
+
+countsPivot <- pivot_wider(
+    countsLong,
+    id_cols = c("group", "lib"),
+    names_from = "ident",
+    values_from = "n"
+)
+countsPivot[is.na(countsPivot)] <- 0
+
+```
+
+```{r save_data, echo=FALSE, warning=FALSE }
+
+write.csv(
+    countsPivot,
+    file.path(analysis_dir, config$outputpath$table, "cell_counts.csv"),
+    quote = FALSE,
+    row.names = FALSE
+)
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

@@ -1,0 +1,379 @@
+---
+title: "GSEA of differential expression between conditions"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  config_id: ""
+  date: !r Sys.Date()
+---
+
+# Notes
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", config_id = "CD4-CD8_A", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c(
+    "Seurat", "future", "stringr", "dplyr", "yaml", "foreach",
+    "doParallel", "doRNG", "fgsea", "msigdbr", "WriteXLS", "knitr"
+)
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# Parallelization with doParallel
+
+registerDoParallel(6)
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r parameters, echo=FALSE}
+
+config_id <- params$config_id
+config_key <- paste0("GSEA_conditions", ifelse(nzchar(config_id), "_", ""), config_id)
+
+config_key_DE <- config[[config_key]]$DE_data
+collections <- config[[config_key]]$collections
+relevantComparisons <- config[[config_key]]$comparisons
+
+if (is.null(collections)) {
+    collections <- c("HALLMARK", "REACTOME", "KEGG", "WIKIPATHWAYS")
+}
+
+fraction_threshold <- config[[config_key]]$fraction_threshold
+
+if (is.null(fraction_threshold)) {
+    fraction_threshold <- 0.7
+}
+
+```
+
+```{r load_data,eval=T,echo=F}
+
+diffExpression <- readRDS(file.path(analysis_dir, config[[config_key_DE]]$results))
+
+```
+
+# Get GSEA gene sets
+
+```{r get_genesets, eval=T, echo=F}
+
+# Show available collections
+
+kable(msigdbr_collections())
+
+species <- firstup(config$species)
+
+collectionMapping <- list(
+    "HALLMARK" = c("H"),
+    "REACTOME" = c("C2", "CP:REACTOME"),
+    "KEGG" = c("C2", "CP:KEGG"),
+    "WIKIPATHWAYS" = c("C2", "CP:WIKIPATHWAYS"),
+    "BIOCARTA" = c("C2", "CP:BIOCARTA"),
+    "TFT_GTRD" = c("C3", "TFT:GTRD"),
+    "IMMUNESIGDB" = c("C7", "IMMUNESIGDB"),
+    "CELL_TYPE_SIGNATURES" = c("C8"),
+    "GO_BP" = c("C5", "GO:BP"),
+    "GO_CC" = c("C5", "GO:CC"),
+    "GO_MF" = c("C5", "GO:MF")
+)
+
+# Fetch tables with selected gene set libraries from MSigDB
+
+msigdbTables <- list()
+
+for (collection in collections) {
+    category <- collectionMapping[[collection]][1]
+    subcategory <- collectionMapping[[collection]][2]
+
+    if(!is.na(subcategory)) {
+        msigdbTables[[collection]] <- msigdbr(
+            species = species, category = category,
+            subcategory = subcategory
+        )
+    } else {
+        msigdbTables[[collection]] <- msigdbr(
+            species = species, category = category
+        )
+    }
+}
+
+# Create a list of gene sets via splitting gene set tables by gene set name
+
+msigdbSets <- lapply(msigdbTables, function(x) split(x$gene_symbol, x$gs_name))
+
+# Make gene symbols unique
+
+msigdbSets <- lapply(
+    msigdbSets, function(geneSetLib) lapply(geneSetLib, function(geneSet) unique(geneSet))
+)
+
+```
+
+```{r process_genesets, eval=T, echo=F}
+
+idents <- names(diffExpression)
+fractionGenesFound <- list()
+msigdbSetsEff <- list()
+
+for (ident in idents) {
+    print(paste0("Identity: ", ident))
+    print(Sys.time())
+
+    fractionGenesFound[[ident]] <- list()
+    msigdbSetsEff[[ident]] <- list()
+    genesTested <- unique(diffExpression[[ident]]$gene)
+
+    for (geneSetLib in names(msigdbSets)) {
+        print(paste0("Gene set library: ", geneSetLib))
+
+        msigdbSetsEff[[ident]][[geneSetLib]] <- list()
+        fractionGenesFound[[ident]][[geneSetLib]] <- rep(NA, length(msigdbSets[[geneSetLib]]))
+        names(fractionGenesFound[[ident]][[geneSetLib]]) <- names(msigdbSets[[geneSetLib]])
+
+        for (geneSet in names(msigdbSets[[geneSetLib]])) {
+            currSet <- msigdbSets[[geneSetLib]][[geneSet]]
+            currSetEff <- currSet[currSet %in% genesTested]
+
+            msigdbSetsEff[[ident]][[geneSetLib]][[geneSet]] <- currSetEff
+            fractionGenesFound[[ident]][[geneSetLib]][geneSet] <- length(currSetEff)/length(currSet)
+        }
+    }
+}
+
+msigdbSetsEffSubset <- list()
+
+for (ident in idents) {
+    msigdbSetsEffSubset[[ident]] <- list()
+
+    for (geneSetLib in names(msigdbSets)) {
+        geneSetsAboveThreshold <- names(fractionGenesFound[[ident]][[geneSetLib]])[
+            fractionGenesFound[[ident]][[geneSetLib]] >= fraction_threshold
+        ]
+        msigdbSetsEffSubset[[ident]][[geneSetLib]] <- msigdbSetsEff[[ident]][[geneSetLib]][
+            geneSetsAboveThreshold
+        ]
+    }
+}
+
+```
+
+```{r prepare_gene_ranks, eval=T, echo=F}
+
+relevantIdents <- idents
+comparisons <- unique(as.character(diffExpression[[1]]$comparison))
+
+if (!is.null(relevantComparisons)) {
+    relevantComparisons <- sapply(relevantComparisons, function(x) paste(x, collapse = "_vs_"))
+} else {
+    relevantComparisons <- comparisons
+}
+
+rankedGenes <- list()
+rankingTables <- list()
+
+for (ident in names(diffExpression)) {
+    rankingTables[[ident]] <- list()
+    rankedGenes[[ident]] <- list()
+
+    for (currComparison in relevantComparisons) {
+        currTable <- diffExpression[[ident]] %>% filter(comparison == currComparison)
+        currTable$comparison <- NULL
+        currTable$p[currTable$p < .Machine$double.xmin] <- .Machine$double.xmin
+
+        negLog10pval <- (-1)*log10(currTable[["p"]])
+        negLog10pvalSigned <- sign(currTable[["logFC"]])*negLog10pval
+        currTable[["signed_neg_log10_p"]] <- negLog10pvalSigned
+        currTable <- currTable[order(
+            -currTable[["signed_neg_log10_p"]],
+            -currTable[["logFC"]]
+        ), ]
+        rankingTables[[ident]][[currComparison]] <- currTable
+        rankedGenes[[ident]][[currComparison]] <- currTable[["signed_neg_log10_p"]]
+        names(rankedGenes[[ident]][[currComparison]]) <- currTable$gene
+    }
+}
+
+```
+
+```{r fgsea, eval=T, echo=F}
+
+fgseaResults <- foreach(ident = names(rankedGenes)) %dorng% {
+    currFgseaResults <- list()
+
+    for (comparison in names(rankedGenes[[ident]])) {
+        print(Sys.time())
+        print(paste0("Identity ", ident, ", comparison: ", comparison))
+
+        currFgseaResults[[comparison]] <- list()
+        currGenes <- rankedGenes[[ident]][[comparison]]
+        
+        for (geneSetLib in names(msigdbSetsEffSubset[[ident]])) {
+            currFgseaResults[[comparison]][[geneSetLib]] <- as.data.frame(
+                fgsea(
+                    pathways = msigdbSetsEffSubset[[ident]][[geneSetLib]],
+                    stats = currGenes,
+                    minSize = 5,
+                    maxSize = 500,
+                    eps = 1e-100,
+                    nPermSimple = 20000
+                )
+            )
+        }
+    }
+
+    currFgseaResults
+}
+names(fgseaResults) <- names(rankedGenes)
+
+```
+
+```{r prepare_fgsea_results, eval=T, echo=F}
+
+fgseaResultsCombined <- list()
+
+colnamesNewOrder <- c(
+    "comparison",
+    "gene_set_lib",
+    "pathway",
+    "pval",
+    "padj_fdr",
+    "NES",
+    "gene_set_coverage",
+    "size",
+    "ES",
+    "padj",
+    "log2err",
+    "leadingEdge"
+)
+
+for (ident in names(fgseaResults)) {
+    fgseaResultsCombined[[ident]] <- data.frame()
+
+    for (comparison in names(fgseaResults[[ident]])) {
+        fgseaResultsComparison <- data.frame()
+
+        for (geneSetLib in names(fgseaResults[[ident]][[comparison]])) {
+            currTable <- fgseaResults[[ident]][[comparison]][[geneSetLib]]
+
+            currTable[["comparison"]] <- comparison
+            currTable[["gene_set_lib"]] <- geneSetLib
+            currTable[["gene_set_coverage"]] <- fractionGenesFound[[ident]][[geneSetLib]][
+                currTable[["pathway"]]
+            ]
+
+            fgseaResultsComparison <- rbind(
+                fgseaResultsComparison,
+                currTable
+            )
+        }
+
+        # P value adjustment per comparison
+
+        fgseaResultsComparison[["padj_fdr"]] <- p.adjust(fgseaResultsComparison[["pval"]], method = "BH")
+
+        fgseaResultsCombined[[ident]] <- rbind(
+            fgseaResultsCombined[[ident]],
+            fgseaResultsComparison
+        )
+    }
+
+    fgseaResultsCombined[[ident]]$comparison <- factor(
+        fgseaResultsCombined[[ident]]$comparison, levels = relevantComparisons
+    )
+
+    fgseaResultsCombined[[ident]] <- fgseaResultsCombined[[ident]][, colnamesNewOrder]
+    fgseaResultsCombined[[ident]] <- as.data.frame(
+        fgseaResultsCombined[[ident]] %>% arrange(comparison, desc(sign(NES)*(-1)*log(padj_fdr)))
+    )
+}
+
+```
+
+```{r p_adj_by_lib, eval=T, echo=F}
+
+for (ident in idents) {
+    fgseaResultsCombined[[ident]] <- fgseaResultsCombined[[ident]] %>%
+        group_by(comparison, gene_set_lib) %>%
+        mutate(padj_fdr_by_lib = p.adjust(pval, method = "BH")) %>%
+        ungroup %>%
+        relocate(padj_fdr_by_lib, .after = padj_fdr)
+}
+
+```
+
+```{r save_data, echo=FALSE, warning=FALSE }
+
+commonFilename <- paste0(
+    "GSEA_cond_nebula",
+    ifelse(nzchar(config_id), paste0("-", config_id), "")
+)
+
+config[[config_key]]$results <- file.path(config$outputpath$data, paste0(commonFilename, ".rds"))
+saveRDS(fgseaResultsCombined, file.path(analysis_dir, config[[config_key]]$results))
+write_yaml(config, file = params$config)
+
+for (ident in idents) {
+    currTables <- list()
+
+    for (currComparison in relevantComparisons) {
+        currTables[[currComparison]] <- fgseaResultsCombined[[ident]] %>%
+            filter(comparison == currComparison) %>% select(!all_of(c("ES", "padj", "log2err", "padj_fdr"))) %>%
+            rename(padj_fdr = padj_fdr_by_lib) %>% arrange(desc(sign(NES)*(-1)*log(padj_fdr)))
+
+        currTables[[currComparison]]$leadingEdge <- sapply(currTables[[currComparison]]$leadingEdge, function(x) paste(x, collapse = ", "))
+    }
+
+    currFilename <- paste0(commonFilename, "_", ident, ".xlsx")
+    WriteXLS(currTables, file.path(analysis_dir, config$outputpath$table, currFilename))
+}
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

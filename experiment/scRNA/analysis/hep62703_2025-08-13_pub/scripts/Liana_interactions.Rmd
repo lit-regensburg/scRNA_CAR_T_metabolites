@@ -1,0 +1,367 @@
+---
+title: "Liana ligand-receptor interactions"
+author: "Inma Hernandez, modified by Malte Simon"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+```{r date, echo=FALSE}
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+
+```{r load libraries,include=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+
+# libraries
+libload<-c("rprojroot", "yaml","Seurat", "tidyverse", "ggpubr","ggrepel", "future", "jj", "cowplot", "liana", "WriteXLS", "readxl")
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, message = F, warning= F, error=T}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multicore", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r default config}
+#column of the meta data to use for grouping (use `clusters` from config if this is set to NULL)
+group_var = NULL 
+#see `liana_wrap`: whether to return all possible interactions. Any interaction with 'expr_prop' below the specific threshold will be assigned to the *worst* possible score in those that pass the threshold.
+return_all_interactions = FALSE 
+#rerun liana if results already exist?
+overwrite = T
+
+
+### not to be modified
+if(is.null(group_var)) group_var = config$scParam$clusters
+umap_use = config$scParam$dimred 
+# Liana output xlsx file
+outname <- sprintf('%s/liana_interactions.xlsx', config$outputpath$table)
+run_liana = !file.exists(file.path(analysis_dir, outname)) | overwrite 
+continue_analysis = TRUE # will be set to false if liana stops with an error
+```
+
+```{r custom functions, message = F, warning= F, error=T}
+
+replace_special_chars = function(vec, pattern = '-| |  |/|\\.', replacement = '_'){
+  if(is.numeric(vec)) warning('Vector is numeric. Converting to character')
+  is_factor = is.factor(vec)
+  if(is_factor) warning('Vector is factor. Returning new factor with mixedsorted levels.')
+  vec = gsub(vec, pattern = pattern, replacement = replacement)
+  if(is_factor) vec = factor(vec, levels = gtools::mixedsort(unique(vec)))
+  vec
+}
+
+add_aggregated_results = function(liana_list){
+  liana_df <- liana_list %>% liana_aggregate()
+#Add cellphonedb scores, by default only a consensus score is shown
+liana_df <- liana_df %>%
+  left_join(
+    dplyr::rename_with(dplyr::select(liana_list[["cellphonedb"]], -pvalue), ~ paste0("cellphonedb.", .x)),
+    by = c(
+      "source" = "cellphonedb.source", 
+      "target" = "cellphonedb.target",
+      "ligand.complex" = "cellphonedb.ligand.complex",
+      "receptor.complex" = "cellphonedb.receptor.complex"))
+
+  outlist = c(list(aggregated = liana_df), liana_list)
+  return(outlist)
+}
+
+#modified from liana
+liana_dotplot = function(liana_res, source_groups = NULL, target_groups = NULL, 
+    ntop = NULL, specificity = "natmi.edge_specificity", magnitude = "sca.LRscore", 
+    y.label = "Interactions (Ligand -> Receptor)", size.label = "Interaction\nSpecificity", 
+    colour.label = "Expression\nMagnitude", show_complex = TRUE, 
+    size_range = c(2, 10), invert_specificity = FALSE, invert_magnitude = FALSE, 
+    invert_function = function(x) -log10(x + 1e-10)) 
+{
+    if(show_complex){
+        entities <- c("ligand.complex", "receptor.complex")
+    }else{
+        entities <- c("ligand", "receptor")
+    }
+    if(!is.null(source_groups)){
+      liana_res <- liana_res %>% dplyr::filter(source %in% source_groups)
+    }
+    if(!is.null(target_groups)){ 
+       liana_res <- liana_res %>%  dplyr::filter(., target %in% target_groups)
+    }
+    if(!is.null(ntop)) {
+        top_int <- liana_res %>% distinct_at(entities) %>% head(ntop)
+        liana_res = liana_res %>% inner_join(top_int, by = entities)
+    }
+    if(invert_magnitude) {
+        liana_res = liana_res %>% mutate(`:=`(!!magnitude, invert_function(.data[[magnitude]])))
+    }
+    if(invert_specificity) {
+        liana_res = liana_res %>% mutate(`:=`(!!specificity, invert_function(.data[[specificity]])))
+    }
+    liana_res = liana_res %>% dplyr::rename(magnitude = !!magnitude) %>% dplyr::rename(specificity = !!specificity) %>% 
+        unite(entities, col = "interaction", sep = " -> ") %>% 
+        unite(c("source", "target"), col = "source_target", remove = FALSE)
+    interactions_order <- liana_res %>% pull("interaction") %>% 
+        unique()
+    liana_res = liana_res %>% dplyr::mutate(interaction = factor(interaction, levels = rev(interactions_order))) %>% 
+        dplyr::mutate(across(where(is.character), as.factor))
+    cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", 
+        "#0072B2", "#D55E00", "#CC79A7", "#DF69A7")
+    suppressWarnings(ggplot(liana_res, aes(x = target, y = interaction, 
+        colour = magnitude, size = specificity)) + #, group = target)) + 
+        geom_point() + scale_color_gradientn(colours = viridis::viridis(20)) + 
+        scale_size_continuous(range = size_range) + #facet_grid(. ~ 
+        #source, space = "free", scales = "free", switch = "y") + 
+        labs(y = y.label, colour = colour.label, size = size.label, 
+            x = "Target", title = "Source") + theme_bw(base_size = 20) + 
+        theme(legend.text = element_text(size = 16), axis.text.x = element_text(colour = cbPalette[1:length(unique(liana_res$source))], 
+            face = "bold", size = 23), axis.title.x = element_text(colour = "gray6"), 
+            axis.text.y = element_text(size = 18, vjust = 0.5), 
+            legend.title = element_text(size = 18), panel.spacing = unit(0.1, 
+                "lines"), strip.background = element_rect(fill = NA), 
+            plot.title = element_text(vjust = 0, hjust = 0.5, 
+                colour = "gray6"), strip.text = element_text(size = 24, 
+                colour = "gray6")))
+}
+
+```
+
+```{r testdata, eval = FALSE}
+# liana_path <- system.file(package = "liana")
+# SObj <- readRDS(file.path(liana_path , "testdata", "input", "testdata.rds"))
+# Idents(SObj) = replace_special_chars(SObj$seurat_annotations)
+```
+
+
+## Introduction
+
+In this R markdown we are going to carry out a Ligand-Receptor analysis using `Liana` - *LIgand-receptor ANalysis frAmework*. You can see the GitHub repository [here](https://github.com/saezlab/liana/) and the vignette [here](https://saezlab.github.io/liana/articles/liana_tutorial.html). 
+Later we will could combine the results with `NicheNet` to identify pathways affected by these interactions as shown [here](https://saezlab.github.io/liana/articles/liana_nichenet.html).
+
+
+```{r load data, echo = FALSE, eval = TRUE}
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_filtered))
+stopifnot(config$scParam$clusters %in% colnames(SObj@meta.data))
+stopifnot(umap_use %in% Reductions(SObj))
+Idents(SObj) = replace_special_chars(SObj@meta.data[[config$scParam$clusters]])
+pt_size = get_point_size(ncol(SObj))
+```
+
+```{r eval = F}
+## Analysis
+#Create new Seurat object 
+
+c_mtrx <- se_obj@assays$RNA@counts
+se_obj[["Cells"]] = Cells(se_obj)
+metadata <- as.data.frame(se_obj@meta.data[,c("Cells","annotation")]) 
+colnames(metadata) = c("Cell","cell_type")
+
+
+#Ensure you do not have forbiden characters in cell type names
+metadata$cell_type <- str_replace_all(metadata$cell_type,
+                                       pattern = " ",
+                                       replacement = "_")
+metadata$cell_type <- str_replace_all(metadata$cell_type,
+                                      pattern = "-",
+                                      replacement = "_")
+metadata$Cell <- str_replace_all(metadata$Cell,
+                                      pattern = "-",
+                                      replacement = "_")
+
+# Create new se_obj
+se <- Seurat::CreateSeuratObject(
+  counts = c_mtrx,
+  meta.data = metadata) %>%
+  Seurat::NormalizeData()
+rm(se_obj)
+gc()
+# set cell identity to cell type
+Idents(se) <- se$cell_type
+table(Idents(se))
+```
+
+
+```{r eval = F}
+#filtering out cells with 0 counts across all ligands and receptors
+#As recommended in this [issue](https://github.com/saezlab/liana/issues/18)
+cells <- colSums(se@assays$RNA@data) > 0
+table(cells)
+se <- se[, cells]
+table(Idents(se))
+```
+
+## Run LIANA
+
+We execute LIANA using default parameters. After LIANA execution, 
+we employ the function `liana_aggregate()` to summarize the output of different 
+methods and to obtain a single score for each interaction.
+
+* By default return_all = FALSE, only interactions whose transmitter and receiver 
+genes are expressed in at least 10% of the cells are considered 
+* Resource consensus can be changed by a custom dataset
+* Run Liana for 5 different methods: "natmi", "connectome", "logfc", "sca", "cellphonedb"
+
+```{r run liana, echo = FALSE, eval = run_liana}
+liana_res <- tryCatch({liana_wrap(
+  SObj,
+  method = c("natmi", "connectome", "logfc", "sca", "cellphonedb"),
+  resource = "Consensus", return_all = return_all_interactions)}, 
+  error = function(cond){
+    message("An error occured during running liana: ", cond, "\nSkipping remainder of the script.")
+    return(list())
+  })
+if(length(liana_res) == 0){
+  continue_analysis = FALSE
+}
+```
+
+
+```{r aggregate results, echo = FALSE, eval = run_liana & continue_analysis, message = TRUE}
+
+outlist = tryCatch({
+  add_aggregated_results(liana_res)
+  }, 
+  error=function(cond){
+    message("An error occured during aggregation:", cond, "\nSaving results without aggregation")
+    return(liana_res)
+})
+
+
+WriteXLS(outlist,
+         ExcelFileName = file.path(analysis_dir, outname),
+         SheetNames=names(outlist), 
+         AdjWidth = TRUE,
+         BoldHeaderRow = TRUE)
+
+config$liana_interactions = outname
+write_yaml(config,file=params$config)
+message('Liana output saved as ', outname)
+```
+
+## Visualization
+
+### Group overview on UMAP
+
+Use the groups defined in the config: `r group_var`
+
+```{r cluster umap, echo = F, message = F, warning = F, eval = continue_analysis}
+plot_df = jj_get_reduction_coords(SObj, redname = umap_use)
+jj_plot_features(reduction = plot_df, meta_features = group_var, cont_or_disc = 'd', label_col='white', label_type = 'geom_label', pt.size = pt_size, do_shuffle = T)
+```
+
+```{r reload liana, echo = F, eval = continue_analysis}
+liana_df = read_excel(file.path(analysis_dir, config$liana_interactions), sheet = 'aggregated')
+liana_df$source = as.character(liana_df$source)
+liana_df$target = as.character(liana_df$target)
+```
+
+### Interaction size heatmap
+
+Vignette text: We will now plot the frequencies of interactions for each pair of potentially communicating cell types. Here, an assumption is implied that the number of interactions inferred between cell types is informative of the communication events occurring in the system. This is a rather strong assumption that one should consider prior to making any conclusions. Our suggestion is that any conclusions should be complimented with further information, such as biological prior knowledge, spatial information, etc.
+
+```{r interaction heatmap, echo=F, eval = continue_analysis}
+liana_trunc <- liana_df %>%
+   # only keep interactions concordant between methods
+  filter(aggregate_rank <= 0.05) # note that these pvals are already corrected
+if(nrow(liana_trunc) > 0){
+  if(length(unique(liana_trunc$source)) > 1 & length(unique(liana_trunc$target)) > 1){
+    try(heat_freq(liana_trunc, grid_text = TRUE))
+  }
+}else{
+  message('No significant liana interactions were found. Skippng remainder of the script.')
+  continue_analysis = FALSE
+}
+
+```
+
+### Interaction dotplots {.tabset}
+
+Note that missing dots are interactions which are not expressed in at least 10% of the cells (by default) in both cell clusters. Only show interactions with adj. p-val <= 0.05 are shown (top 30)
+
+```{r generate liana dotplots, echo = F, warning = FALSE, eval = continue_analysis}
+gg = list()
+target_groups = unique(liana_trunc$target)
+for(i in levels(mixsort_factor(liana_trunc$source))){
+   gg[[i]] = liana_trunc %>%
+        mutate(interact = glue::glue("{ligand.complex}_{receptor.complex}")) %>%
+        dplyr::filter(source == i) %>%
+        # # invert size (low p-value/high specificity = larger dot size)
+        # # + add a small value to avoid Infinity for 0s
+        mutate(aggregate_rank_inv = -log10(aggregate_rank + 1e-10)) %>%
+        liana_dotplot(source_groups = i,
+                      ntop = 30,
+            #target_groups = target_groups,
+            specificity = "aggregate_rank_inv", #natmi.edge_specificity
+            magnitude = "sca.LRscore",
+            show_complex = TRUE) +
+        labs(size = "-log10(aggregate rank)", color = "Mean L-R Expression") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 14, color = "black"),
+              axis.text.y = element_text(size = 8))
+}
+
+# (plt <- liana_df %>%
+#         mutate(interact = glue::glue("{ligand.complex}_{receptor.complex}")) %>%
+#         #dplyr::filter(interact %in% interactions) %>%
+#         # arrange(aggregate_rank) %>%
+#         # slice_head(n = n) %>%
+#         filter(aggregate_rank <= 0.05) %>% # only keep interactions with p-val <= 0.05
+#         # # invert size (low p-value/high specificity = larger dot size)
+#         # # + add a small value to avoid Infinity for 0s
+#         mutate(aggregate_rank_inv = -log10(aggregate_rank + 1e-10)) %>%
+#         liana_dotplot(source_groups = c("target_population"),
+#             target_groups = tt,
+#             specificity = "aggregate_rank_inv", #natmi.edge_specificity
+#             magnitude = "sca.LRscore",
+#             show_complex = TRUE) +
+#         labs(size = "-log10(aggregate rank)", color = "Mean L-R Expression") +
+#         theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 14, color = "black")))
+# 
+# plt_table <- plt$data
+# saveRDS(plt_table, file = glue::glue(path, table))
+# cowplot::save_plot("Liana/results/´LianaHeatmap_sca.LRscore.pdf", plot = plt1, base_height = 25, base_width = 25)
+
+```
+
+```{r plot liana dotplots, results='asis', warning = F, echo = FALSE, eval = continue_analysis}
+
+for (i in 1:length(gg)){
+  cat("#### ",names(gg)[i],"\n")
+  try(print(gg[[i]]))
+  cat('\n\n')
+}
+```
+
+## SessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```

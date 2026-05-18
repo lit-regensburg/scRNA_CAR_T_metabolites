@@ -1,0 +1,120 @@
+---
+title: "ShinyCell"
+author: "Malte Simon"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+## Overview and prerequisites
+
+This script creates a ShinyCell app, which can be used to explore scRNA datasets interactively. For more information, have a look at\
+https://academic.oup.com/bioinformatics/article/37/19/3374/6198103 \
+https://github.com/SGDDNB/ShinyCell/tree/master
+
+```{r install ShinyCell, echo = T, eval = F}
+
+# The following packages need to be installed to run ShinyCell
+reqPkg = c("shiny", "shinyhelper", "data.table", "Matrix", "DT", "hdf5r", 
+           "reticulate", "ggplot2", "gridExtra", "magrittr", "ggdendro")
+newPkg = reqPkg[!(reqPkg %in% installed.packages()[,"Package"])]
+if(length(newPkg)){install.packages(newPkg)}
+devtools::install_github("SGDDNB/ShinyCell")
+```
+
+```{r date, echo=FALSE}
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries,include=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+
+# libraries
+
+libload<-c("rprojroot", "yaml","Seurat", "tidyverse", "future", "jj", "SingleCellExperiment", "ShinyCell")
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, message = F, warning= F, error=T}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r default config}
+```
+
+```{r custom functions, message = F, warning= F, error=T}
+
+```
+
+## Create ShinyCell app
+
+The app can be started from R using 
+
+```{r instruction, echo = TRUE, eval = FALSE}
+shiny::runApp(appDir = 'path/to/shinyApp/')
+```
+
+
+```{r loaddata}
+
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_filtered ))
+sce <- as.SingleCellExperiment(SObj, assay = "RNA")
+
+```
+
+```{r create shinycell config, message = TRUE}
+
+#TODO: find option to set defaults for default.gene1 and 2 and default.multigene as well as title
+#TODO: option to cap values to make them better visible
+
+scConf = createConfig(sce)
+
+```
+
+```{r create shinycell app, message = TRUE, warning = TRUE}
+
+# Create ShinyApp in tmp directory and copy it to destination afterwards to
+# handle filesystem hdf5 issues
+
+shiny_dir <- file.path(analysis_dir, config$outputpath$data, "shinyApp")
+shiny_dir_tmp <- file.path(tempdir(), "shinyApp")
+dir.create(shiny_dir_tmp)
+
+makeShinyApp(sce, scConf = scConf, gene.mapping = FALSE, shiny.dir = shiny_dir_tmp)
+
+message('Creating ShinyCell app in directory: ', shiny_dir)
+
+file.copy(shiny_dir_tmp, dirname(shiny_dir), recursive = TRUE)
+
+```
+
+## SessionInfo()
+
+```{r sessionInfo,echo=T}
+sessionInfo()
+```

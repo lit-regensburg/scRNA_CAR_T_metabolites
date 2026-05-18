@@ -1,0 +1,714 @@
+---
+title: "QC_report"
+author: "Inma Hernandez & Nicholas Strieder, modified by Malte Simon"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# libraries
+
+libload<-c("rprojroot", "yaml","Seurat","ggpubr","tidyverse","plyr","ggplot2","knitr",
+        "cowplot","ggExtra", "ggforce","harmony","WriteXLS","Nebulosa","future",'plotly',
+        'scales','ggbeeswarm', 'ggrepel','jj', 'DropletUtils', 'grid','gridExtra',
+        'viridis','ggpointdensity', 'UpSetR')
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, error=T}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+data_dir <- root_directories[["data"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multicore", workers = 6)
+#plan()
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r default config}
+#generate umap plots before and after barcode filtering (Script runs considerably longer)?
+umap_plot = TRUE
+#define coordinates for the threshold lines within plots
+config$filters$min_lib_ncounts = setIfNull(config$filters$min_lib_ncounts, 500)
+nCount_thres_line = config$filters$min_lib_ncounts 
+config$filters$min_n_feats = setIfNull(config$filters$min_n_feats, 250)
+nFeat_thres_line = config$filters$min_n_feats 
+config$filters$max_pct_mt = setIfNull(config$filters$max_pct_mt, 5)
+pct_mt_thres_line = config$filters$max_pct_mt
+```
+
+## Cellranger sample metrics summary
+
+```{r metrics_summary, message = TRUE, fig.height = 12, fig.width = 8}
+samples<-list.dirs(file.path(data_dir, config$inputpath),full.names=F,recursive=F)
+samples <- samples[grep("libinfo",samples,invert=T)]
+path_to_data <- sapply(gsub('-','_',samples), #is there a fixed naming convention, eg always use _
+                       function(x) file.path(data_dir, config$inputpath,
+                                                   x,"outs","metrics_summary.csv"))
+#path_to_data = Sys.glob('~/projects/p036/experiments/scRNA_scCSF/analysis/customanalysis/Malte/data/*metrics_summary.csv')
+if(length(path_to_data) > 0){
+  metrics_list = try(lapply(path_to_data, function(x) rownames_to_column(as.data.frame(t(read_csv(x, show_col_types = F))),'name')))
+  if(class(metrics_list)[1] == 'try-error'){
+    message(sprintf('Error when reading metris_summary. First file: %s', path_to_data[1]))
+  }else{
+    metrics_df = purrr::reduce(metrics_list, left_join, by = "name")
+  colnames(metrics_df) = c('stats', names(path_to_data))
+  #colnames(metrics_df) = c('stats', gsub('_metrics_summary.csv','', basename(basename(path_to_data))))
+  #metrics_df = read_csv('~/metrics.csv')
+  #colnames(metrics_df)[1] = 'stats'
+  metrics_long_df = metrics_df %>% pivot_longer(!stats, names_to = "sample_name", values_to = "value")
+  metrics_long_df$value = as.numeric(gsub('%','',metrics_long_df$value))
+  
+  p1 <- ggplot(metrics_long_df, aes(x=stats, y=value)) +
+    geom_violin(aes(fill=stats),width=1.4, alpha = 0.6) +
+    #scale_fill_manual(values = as.vector(pals::cols25(19))) +
+    geom_quasirandom(aes(color = sample_name),
+      priority = 'ascending',
+                  shape = 21, fill= "white",
+                  size = 3, stroke = .5, alpha = 0.8,
+               width = 0.2) +
+    theme_bw() +
+    facet_wrap(vars(stats), scales = "free", ncol = 3) +
+    theme(axis.text.x=element_blank()) +
+    theme(legend.position = "none",
+          panel.spacing.x = unit(10, "mm"),
+          panel.spacing.y = unit(10, "mm"))
+    
+    if(length(path_to_data) > 1){
+      ggplotly(p1)
+    }else{
+      p1
+    }
+  }
+}else{
+  message('No metrics_summary.csv files fround in ', file.path(analysis_dir, config$inputpath))
+}
+
+```
+
+```{r loaddata, message = TRUE, warning=TRUE}
+
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_rawall))
+pt_size = get_point_size(ncol(SObj))
+#plot DropletQC results? Depends on bam file availability and calculation in script 'Preprocessing.Rmd'
+nf_avail = all(c('nuclear_fraction','cell_status') %in% colnames(SObj@meta.data))
+if(nf_avail)  nf_avail = !all(is.na(SObj$nuclear_fraction))
+
+```
+
+```{r remove_doublet_negative, message = TRUE, warning=TRUE, eval=config$cellhash}
+
+#plot common distribution number of counts, number of features
+p  = ggplot(SObj@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) +
+  geom_point(aes(color = HTO_classification.global), size = 1) +
+  scale_y_continuous(trans = "log10") + scale_x_continuous(trans = "log10") + theme_cowplot(12) +
+  geom_vline(xintercept = nCount_thres_line, linetype = 3) +
+  geom_hline(yintercept = nFeat_thres_line, linetype = 3)
+print(p)
+
+kable(table(SObj$HTO_classification, SObj$lib), caption = "Library to hash signals mapping")
+kable(table(SObj$group, SObj$lib), caption = 'Library to hash ID mapping before filtering')
+
+SObj$keep_cells <- !(SObj$group %in% c("Doublet", "Negative"))
+keep_cells <- colnames(SObj)[SObj$keep_cells]
+SObj <- subset(SObj, cells = keep_cells)
+
+kable(
+  table(SObj$group, SObj$lib),
+  caption = 'Reducing data to hash singlets. Retained barcodes after doublet and negative hash ID removal'
+)
+
+```
+
+```{r remove_comp_doublets, message = TRUE, warning=TRUE}
+
+if (config$remove_doublets %in% c("computed", "all")) {
+  SObj$keep_cells <- SObj$scDblFinder.class == "singlet"
+  keep_cells <- colnames(SObj)[SObj$keep_cells]
+
+  print(paste0("Removing ", sum(!SObj$keep_cells), " computationally predicted doublets"))
+
+  SObj <- subset(SObj, cells = keep_cells)
+}
+
+```
+
+```{r MTRiboCalc,message=T,warning=T}
+
+if(config$species=="mus musculus"){
+  mitopatt = "^mt-"
+  ribopatt="^Rp[sl]"
+}else if (config$species=="homo sapiens"){
+  mitopatt = "^MT-"
+  ribopatt="^RP[SL]"
+}else{
+    stop("unknown species")
+}
+SObj[["percent.mt"]] <- PercentageFeatureSet(SObj, pattern = mitopatt)
+SObj[["percent.ribo"]] <- PercentageFeatureSet(SObj, pattern = ribopatt)
+
+```
+
+## QC metrics table and violins for complete dataset {.tabset}
+
+The main qc metrices for single cell data a number of genes per cell (aka nFeature_RNA),
+number of reads per cell (aka nCount_RNA) and percentage of Mitochondrial genes (percent.mt).
+
+```{r QCTable}
+sprintf('Threshold lines shown at nCount_RNA = %i, nFeature_RNA = %i, percent.mt = %i', nCount_thres_line, nFeat_thres_line, pct_mt_thres_line)
+
+df <- ddply(
+  SObj@meta.data, .(sample), summarize,
+  nBarcodes=length(nCount_RNA), #Malte
+  nCount_RNAmean=mean(nCount_RNA),
+  nCount_RNAmedian=median(nCount_RNA),
+  nFeature_RNAmean=mean(nFeature_RNA),
+  nFeature_RNAmedian=median(nFeature_RNA)
+)
+
+kable(df,caption="nCount and nFeature Statistics")
+```
+
+### nCount RNA
+
+```{r QCMet1}
+VlnPlot(SObj, features = c("nCount_RNA"), group.by = "sample", pt.size = -1)
+```
+
+### nFeature RNA
+
+```{r QCMet2}
+VlnPlot(SObj, features = c("nFeature_RNA"), group.by = "sample", pt.size = -1)
+```
+
+### Percent mitochondrial 
+
+```{r QCMet3}
+VlnPlot(SObj, features = c("percent.mt"), group.by = "sample", pt.size = -1)
+```
+
+### Percent ribosomal 
+
+```{r QCMet4}
+VlnPlot(SObj, features = c("percent.ribo"), group.by = "sample", pt.size = -1)
+```
+
+## Counts vs features scatterplots
+
+### Complete dataset {.tabset}
+
+#### Coloured by mitochondrial fraction
+
+```{r Distribution1}
+#plot common distribution number of counts, number of features
+mid <- 25
+p  = ggplot(SObj@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) + geom_point(aes(color = percent.mt), size = pt_size) +
+scale_color_gradient2(midpoint = mid, low = "black", mid = "grey", high ="red") + scale_y_continuous(trans = "log10") + scale_x_continuous(trans = "log10") + theme_cowplot(12) + geom_vline(xintercept = nCount_thres_line, linetype = 3) + geom_hline(yintercept = nFeat_thres_line, linetype = 3) 
+ggMarginal(p, type = "densigram", size = 10)
+```
+
+#### Coloured by ribosomal fraction
+
+```{r Distribution2}
+p  = ggplot(SObj@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) + geom_point(aes(color = percent.ribo), size = pt_size) +
+scale_color_gradient2(midpoint = mid, low = "black", mid = "grey", high ="red") + scale_y_continuous(trans = "log10") + scale_x_continuous(trans = "log10") + theme_cowplot(12) + geom_vline(xintercept = nCount_thres_line, linetype = 3) + geom_hline(yintercept = nFeat_thres_line, linetype = 3) 
+ggMarginal(p, type = "densigram", size = 10)
+
+```
+
+### Individual samples {.tabset}
+
+```{r Distribution3}
+#plot individual distribution number of counts, number of features
+
+gg_nCount_nFeat_mito = lapply(unique(SObj$sample), function(x){
+  ggplot(SObj@meta.data[SObj$sample == x, ], aes(x = nCount_RNA, y = nFeature_RNA)) + geom_point(aes(color = percent.mt), size = 1) +
+scale_color_gradient2(midpoint = mid, low = "black", mid = "grey", high ="red") + scale_y_continuous(trans = "log10") + scale_x_continuous(trans = "log10") + theme_cowplot(12) + facet_wrap( ~sample, ncol = 2) + geom_vline(xintercept = nCount_thres_line, linetype = 3) + geom_hline(yintercept = nFeat_thres_line, linetype = 3)
+})
+
+
+gg_nCount_nFeat_ribo = lapply(unique(SObj$sample), function(x){
+  ggplot(SObj@meta.data[SObj$sample == x, ], aes(x = nCount_RNA, y = nFeature_RNA)) + geom_point(aes(color = percent.ribo), size = 1) +
+scale_color_gradient2(midpoint = mid, low = "black", mid = "grey", high ="red") + scale_y_continuous(trans = "log10") + scale_x_continuous(trans = "log10") + theme_cowplot(12) + facet_wrap( ~sample, ncol = 2) + geom_vline(xintercept = nCount_thres_line, linetype = 3) + geom_hline(yintercept = nFeat_thres_line, linetype = 3)
+})
+```
+
+#### Coloured by mitochondrial fraction {.tabset}
+
+```{r, results='asis', echo = FALSE, warning = F}
+for (i in 1:length(gg_nCount_nFeat_mito)){
+  cat("##### ",unique(SObj$sample)[i],"\n")
+  print(gg_nCount_nFeat_mito[[i]])  
+  cat('\n\n')
+}
+```
+
+#### Coloured by ribosomal fraction {.tabset}
+
+```{r, results='asis', echo = FALSE, warning = F}
+for (i in 1:length(gg_nCount_nFeat_ribo)){
+  cat("##### ",unique(SObj$sample)[i],"\n")
+  print(gg_nCount_nFeat_ribo[[i]])  
+  cat('\n\n')
+}
+```
+
+## Histograms 
+### Complete dataset {.tabset}
+
+```{r Merged histograms, eval = F, echo = F}
+# n_genes_hist1 <- SObj@meta.data %>%
+#   ggplot(aes(nCount_RNA)) +
+#     geom_histogram(bins = 100) +
+#     labs(x =  "Library Size (total UMI)", y = "Number of Cells") +
+#     # scale_x_log10() +
+#     theme_pubr() + 
+#   geom_vline(xintercept = nCount_thres_line)
+# 
+# n_genes_hist2 <- SObj@meta.data %>%
+#   ggplot(aes(nCount_RNA)) +
+#     geom_histogram(bins = 100) +
+#     scale_x_continuous(limits = c(0, 4000)) +
+#     labs(x =  "Library Size (total UMI)", y = "Number of Cells") +
+#     theme_pubr() + 
+#   geom_vline(xintercept = nCount_thres_line)
+# 
+# ggarrange(plotlist = list(n_genes_hist1, n_genes_hist2), ncol = 2)
+
+# n_genes_hist1 <- SObj@meta.data %>%
+#   ggplot(aes(nFeature_RNA)) +
+#     geom_histogram(bins = 100) +
+#     labs(x = "Number of Detected Genes", y = "Number of Cells") +
+#     # scale_x_log10() +
+#     theme_pubr() +
+#   geom_vline(xintercept = nFeat_thres_line)
+# 
+# n_genes_hist2 <- SObj@meta.data %>%
+#   ggplot(aes(nFeature_RNA)) +
+#     geom_histogram(bins = 100) +
+#     scale_x_continuous(limits = c(0, 2000)) +
+#     labs(x = "Number of Detected Genes", y = "Number of Cells") +
+#     theme_pubr() + 
+#   geom_vline(xintercept = nFeat_thres_line)
+
+# ggarrange(plotlist = list(n_genes_hist1, n_genes_hist2), ncol = 2)
+
+# #nFeature histograms for all samples
+# hist1 <- SObj@meta.data %>%
+#   ggplot(aes(percent.mt)) +
+#     geom_histogram(bins = 100) +
+#     labs(x = "Percentage mitochondrial reads", y = "Number of Cells") +
+#     # scale_x_log10() +
+#     theme_pubr() +
+#   geom_vline(xintercept = pct_mt_thres_line)
+# hist1
+```
+
+#### nCount RNA
+
+```{r Merged histograms1}
+#nCount histograms for all samples
+ggplot(SObj@meta.data, aes(nCount_RNA)) +
+  geom_histogram(bins = 200) +
+  labs(x =  "Library Size (total UMI)", y = "Number of Cells") + 
+  geom_vline(xintercept = nCount_thres_line) + 
+  facet_zoom(xlim = c(0, 4000))
+```
+
+#### nFeature RNA
+
+```{r Merged histograms2}
+# nFeature histograms for all samples
+ggplot(SObj@meta.data, aes(nFeature_RNA)) +
+  geom_histogram(bins = 200) +
+  labs(x =  "Number of Detected Genes", y = "Number of Cells") +
+  geom_vline(xintercept = nFeat_thres_line) +
+  facet_zoom(xlim = c(0, 1500))
+```
+
+#### Percentage mitochondrial 
+
+```{r Merged histograms3}
+# mito fraction histograms for all samples 
+ggplot(SObj@meta.data, aes(percent.mt)) +
+  geom_histogram(bins = 200) +
+  labs(x =  "Percentage mitochondrial reads", y = "Number of Cells") +
+  geom_vline(xintercept = pct_mt_thres_line) +
+  facet_zoom(xlim = c(2, 10))
+
+
+```
+
+### Individual samples
+
+```{r Per Sample histograms, include = F}
+
+#nCount RNA
+gg_nCount = lapply(unique(SObj$sample), function(x){
+  jj_plot_hist_wo0(feature_vec = SObj@meta.data[SObj$sample == x, 'nCount_RNA'], 
+                   thres = nCount_thres_line, xlab = 'nCount_RNA', title = x, plot_numbers = 1:2, pad = 10) + 
+    theme(legend.position = 'none', axis.text.x=element_text(angle=30, hjust=1)) 
+})
+#ggarrange(plotlist = gg_list, ncol = 2)
+
+##zoomed
+gg_nCount_zoom = lapply(unique(SObj$sample), function(x){
+  jj_plot_hist_wo0(feature_vec = SObj@meta.data[SObj$sample == x, 'nCount_RNA'], 
+                   thres = nCount_thres_line, xlab = 'nCount_RNA', plot_numbers = NULL) + 
+    theme(legend.position = 'none', axis.text.x=element_text(angle=30, hjust=1))+ 
+    scale_x_continuous(limits = c(0, 4000))
+})
+#ggarrange(plotlist = gg_list, ncol = 2)
+
+# nFeature RNA
+gg_nFeature = lapply(unique(SObj$sample), function(x){
+  jj_plot_hist_wo0(feature_vec = SObj@meta.data[SObj$sample == x, 'nFeature_RNA'], 
+                   thres = nFeat_thres_line, xlab = 'nFeature_RNA', title = x, plot_numbers = 1:2, pad = 10) + 
+    theme(legend.position = 'none')
+})
+#ggarrange(plotlist = gg_list, ncol = 2)
+
+#zoomed
+gg_nFeature_zoom = lapply(unique(SObj$sample), function(x){
+  jj_plot_hist_wo0(feature_vec = SObj@meta.data[SObj$sample == x, 'nFeature_RNA'], 
+                   thres = nFeat_thres_line, xlab = 'nFeature_RNA', plot_numbers = NULL, pad = 10) + 
+    theme(legend.position = 'none')  +
+    scale_x_continuous(limits = c(0, 1500))
+})
+#ggarrange(plotlist = gg_list, ncol = 2)
+
+#percent.mt
+gg_pctmt = lapply(unique(SObj$sample), function(x){
+  jj_plot_hist_wo0(feature_vec = SObj@meta.data[SObj$sample == x, 'percent.mt'], 
+                   thres = pct_mt_thres_line, xlab = 'percent.mt', cols = c('lightblue','red'), title = x, plot_numbers = 1:2, pad = 10) + 
+    theme(legend.position = 'none') 
+})
+#ggarrange(plotlist = gg_list, ncol = 2)
+```
+
+#### nCount RNA {.tabset}
+
+```{r, results='asis', echo = FALSE, warning = F}
+for (i in 1:length(gg_nCount)){
+  cat("##### ",unique(SObj$sample)[i],"\n")
+  print(grid.arrange(gg_nCount[[i]], gg_nCount_zoom[[i]], ncol = 2))  
+  cat('\n\n')
+}
+#y <- arrangeGrob(gg_nCount[[i]], gg_nCount_zoom[[i]], ncol = 2)
+#print(grid.draw(y))
+```
+
+#### nFeature RNA {.tabset}
+
+```{r, results='asis', echo = FALSE, warning = F}
+for (i in 1:length(gg_nFeature)){
+  cat("##### ",unique(SObj$sample)[i],"\n")
+  print(grid.arrange(gg_nFeature[[i]], gg_nFeature_zoom[[i]], ncol = 2))
+  cat('\n\n')
+}
+```
+
+#### Percentage mitochondrial {.tabset}
+
+```{r, results='asis', echo = FALSE, warning = F}
+for (i in 1:length(gg_pctmt)){
+  cat("##### ",unique(SObj$sample)[i],"\n")
+  print(gg_pctmt[[i]])
+  cat('\n\n')
+}
+```
+
+## Housekeeping gene expression
+
+Number of expressed housekeeping genes defined by Tirosh et al., 2016 (PMID: 27806376).
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5465819/
+
+```{r housekeeping, message = TRUE}
+tirosh_2016_hk = "ACTB,B2M,HNRPLL,HPRT,PSMB2,PSMB4,PPIA,PRPS1,PRPS1L1,PRPS1L3,PRPS2,PRPSAP1,PRPSAP2,RPL10,RPL10A,RPL10L,RPL11,RPL12,RPL13,RPL14,RPL15,RPL17,RPL18,RPL19,RPL21,RPL22,RPL22L1,RPL23,RPL24,RPL26,RPL27,RPL28,RPL29,RPL3,RPL30,RPL32,RPL34,RPL35,RPL36,RPL37,RPL38,RPL39,RPL39L,RPL3L,RPL4,RPL41,RPL5,RPL6,RPL7,RPL7A,RPL7L1,RPL8,RPL9,RPLP0,RPLP1,RPLP2,RPS10,RPS11,RPS12,RPS13,RPS14,RPS15,RPS15A,RPS16,RPS17,RPS18,RPS19,RPS20,RPS21,RPS24,RPS25,RPS26,RPS27,RPS27A,RPS27L,RPS28,RPS29,RPS3,RPS3A,RPS4X,RPS5,RPS6,RPS6KA1,RPS6KA2,RPS6KA3,RPS6KA4,RPS6KA5,RPS6KA6,RPS6KB1,RPS6KB2,RPS6KC1,RPS6KL1,RPS7,RPS8,RPS9,RPSA,TRPS1,UBB"
+hkgenes = unlist(strsplit(tirosh_2016_hk, ','))
+hk_avail = which(toupper(rownames(LayerData(SObj, assay = "RNA", layer = "counts"))) %in% hkgenes)
+if(length(hk_avail)>50){
+  SObj$n_expr_hkgenes = Matrix::colSums(LayerData(SObj, assay = "RNA", layer = "counts")[hk_avail, ] > 0)
+  print(VlnPlot(SObj, features='n_expr_hkgenes', group.by = "sample", pt.size = -1))
+  
+  # p1<-ggplot(SObj@meta.data, aes(x = nCount_RNA, y = nFeature_RNA)) + geom_point(aes(color = n_expr_hkgenes), size = 1) + scale_y_continuous(trans = "log10") + scale_x_continuous(trans = "log10") + theme_cowplot(12) + facet_wrap( ~sample, ncol = 2) + geom_vline(xintercept = nCount_thres_line, linetype = 3) 
+  
+  p2<-ggplot(SObj@meta.data, aes(x = nCount_RNA, y = n_expr_hkgenes)) + geom_point(aes(color = percent.mt), size = 1) + scale_color_gradient2(midpoint = mid, low = "black", mid = "grey", high ="red") + scale_y_continuous(trans = "log10") + scale_x_continuous(trans = "log10") + theme_cowplot(12) + facet_wrap( ~sample, ncol = 2) + geom_vline(xintercept = nCount_thres_line, linetype = 3) 
+  #ggarrange(plotlist = list(p1, p2))
+  print(p2)
+}
+```
+
+`r if(nf_avail) {"## Nuclear fraction {.tabset}"}`
+
+```{r nuclear fraction, eval = nf_avail}
+SObj$log10_nCount_RNA = log10(SObj$nCount_RNA)
+SObj$cell_status[is.na(SObj$cell_status)] = 'unknown'
+gg_nf = lapply(unique(SObj$sample), function(x){
+  try(FeatureScatter(SObj[, SObj$sample == x], feature1 = 'nuclear_fraction', feature2 = 'log10_nCount_RNA', group.by = 'cell_status', pt.size = pt_size) + scale_colour_manual(values = c(cell='#E41A1C', emtpy_droplet='#377EB8', damaged_cell='#4DAF4A', unknown = 'grey80')))
+})
+SObj$log10_nCount_RNA = NULL
+```
+
+```{r, results='asis', eval = nf_avail}
+for (i in 1:length(gg_nf)){
+  cat("### ",unique(SObj$sample)[i],"\n")
+  try(print(gg_nf[[i]]))
+  cat('\n\n')
+}
+```
+
+
+## Knee plots {.tabset}
+
+Based on DropletUtils (https://bioconductor.org/packages/release/bioc/vignettes/DropletUtils/inst/doc/DropletUtils.html)
+
+The knee and inflection points on the curve mark the transition between two components of the total count distribution. This is assumed to represent the difference between empty droplets with little RNA and cell-containing droplets with much more RNA.
+
+```{r knee plot, include =F}
+
+Idents(SObj) <- SObj$sample
+samples <- levels(Idents(SObj))
+
+plot.list <- lapply(samples, function(x) {
+  Subset <- subset(SObj, cells = WhichCells(SObj, idents = x))
+  barcode <- DropletUtils::barcodeRanks(LayerData(Subset, assay = "RNA", layer = "counts"))
+  bcRanks <- as.data.frame(barcode)
+  barcode_points <- data.frame(
+  Legend = c("inflection", "knee"),
+  value = c(barcode@metadata$inflection, barcode@metadata$knee))
+
+  gg <- ggplot(data = bcRanks, aes(x = rank, y = total)) +
+    geom_point() +
+    geom_hline(data = barcode_points,
+               aes(yintercept = value,
+                   colour = Legend), linetype = 2) +
+    scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+    scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+                  labels = trans_format("log10", math_format(10^.x))) +
+    theme_pubr() + 
+    # theme(legend.position="none",
+    #       plot.subtitle = element_text(size = 9),
+    #       axis.title.x = element_blank(),
+    #       axis.title.y = element_blank()) +
+    coord_fixed() +
+    labs(title = x, subtitle = sprintf('Knee: %s, Inflection: %s', as.character(barcode_points$value[2]), as.character(barcode_points$value[1])),
+         x = 'Log rank', y = 'Log counts')
+})
+
+names(plot.list) <- samples
+
+# legend <- get_legend(
+#   plot.list[[1]] +
+#     guides(color = guide_legend(nrow = 1)) +
+#     theme(legend.position = "bottom")
+# )
+# #plot in two columns
+# p <- cowplot::plot_grid(plotlist = plot.list, ncol = 1)
+# #add legend at the bottom of the plot
+# p <- cowplot::plot_grid(p, legend, ncol = 1, rel_heights = c(1, .05))
+# 
+# #add y axis and x axis text
+# y.grob <- textGrob("Log counts",
+#                    gp=gpar(fontface="bold", fontsize=15), rot=90)
+# 
+# x.grob <- textGrob("Log rank",
+#                    gp=gpar(fontface="bold", fontsize=15))
+# 
+# grid.arrange(arrangeGrob(p, left = y.grob, bottom = x.grob, ncol = 1), newpage = T)
+
+```
+
+
+```{r, results='asis'}
+for (i in 1:length(plot.list)){
+  cat("### ",names(plot.list)[i],"\n")
+  print(plot.list[[i]])
+  cat('\n\n')
+}
+```
+
+## Filter out low quality barcodes
+
+```{r define low quality barcodes, message=TRUE}
+# if parameters are set in config, subsetting possible
+nonset_filters = sapply(config$filters, is.null)
+if(!all(nonset_filters)){
+  set_filters = config$filters[!nonset_filters]
+  message(cat(paste0('Barcode filter criteria\n',
+               paste(sapply(seq_along(set_filters), function(x) sprintf('%s: %i', names(set_filters)[x],
+                                                                        set_filters[[x]])), collapse = '\n'))))
+  
+  filter_out_list = list(
+    nCount_RNA_below = which(SObj$nCount_RNA < config$filter$min_lib_ncounts),
+    nFeature_RNA_below = which(SObj$nFeature_RNA < config$filter$min_n_feats),
+    percent_mt_above = which(SObj$percent.mt > config$filter$max_pct_mt))
+  names(filter_out_list) = c(
+    paste0('nCount_RNA_below_', as.character(config$filters$min_lib_ncounts)),
+    paste0('nFeature_RNA_below_', as.character(config$filters$min_n_feats)),
+    paste0('percent_mt_above_', as.character(config$filters$max_pct_mt))
+  )
+  filter_out_list = filter_out_list[sapply(filter_out_list, length) > 0]
+  
+  if(length(filter_out_list) > 1){
+    #TODO: left hand axis gets cut off
+    print(jj_plot_upsetr(filter_out_list))
+  }else{
+    message(sapply(filter_out_list, length))
+  }
+
+  is_low_quality <- 
+    SObj$nCount_RNA < config$filter$min_lib_ncounts |
+    SObj$nFeature_RNA < config$filter$min_n_feats |
+    SObj$percent.mt > config$filter$max_pct_mt
+  
+  any_bad_cells = any(is_low_quality)
+  
+  message(cat(sprintf('Low quality barcodes: %i\nHigh quality barcodes: %i', sum(is_low_quality), sum(!is_low_quality))))
+  #print(table(is_low_quality))
+  SObj$keep_cells <- !is_low_quality
+  Idents(SObj) <- "keep_cells"
+  #print(table(SObj$keep_cells))
+}
+```
+
+```{r umaps before filtering, eval = umap_plot}
+# plot umaps with different QC features before filtering out cells
+ggb = gga = list()
+
+SObj = suppressMessages(quick_reduction_rna(SObj, ndims = 20, nfeatures = 1000))
+mt = 'before filtering'
+
+if(any_bad_cells){
+  SObj$low_quality = is_low_quality
+  ggb[['low_quality']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap',
+                                                           meta_features = 'low_quality', pt.size = pt_size,
+                                                           use_pointdensity = T, show_background_cells = T,
+                                                           foreground_subset_bool = SObj$low_quality,  do_shuffle = F,
+                                                           my_title = 'Low quality barcodes highlighted', return_gg_object = T)[[1]])
+  SObj$low_quality = NULL
+}else{
+  #if there are no low quality barcodes, plot cell density instead
+  ggb[['low_quality']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = NULL, 
+                                                           pt.size = pt_size, use_pointdensity = T, 
+                                                           my_title = 'Cell density', do_shuffle = F,
+                                                           return_gg_object = T)[[1]])
+}
+
+ggb[['nCount_RNA']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'nCount_RNA',
+                                                        cap_top = 'auto', return_gg_object = T, do_shuffle = T, 
+                                                        pt.size = pt_size, my_title = mt, cont_or_disc = 'c')[[1]])
+ggb[['percent.mt']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'percent.mt', 
+                                                         cap_top = 'auto', return_gg_object = T, pt.size = pt_size, do_shuffle = T,
+                                                         my_title = mt, cont_or_disc = 'c')[[1]])
+ggb[['percent.ribo']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'percent.ribo', pt.size = pt_size, do_shuffle = T,
+                                                          cap_top = 'auto',  return_gg_object = T, 
+                                                          my_title = mt, cont_or_disc = 'c')[[1]])
+if(nf_avail){
+  ggb[['nuclear_fraction']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'nuclear_fraction',  pt.size = pt_size, do_shuffle = T,
+                                                                cap_top = 'auto',  return_gg_object = T, 
+                                                                my_title = mt, cont_or_disc = 'c')[[1]])
+  ggb[['cell_status']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'cell_status',  pt.size = pt_size, do_shuffle = T,
+                                                          return_gg_object = T, my_title = mt, 
+                                                          cont_or_disc = 'd')[[1]])
+}
+
+
+```
+
+
+```{r remove low quality barcodes from SObj, message=T}
+SObj <- subset(SObj, idents = TRUE)
+```
+
+
+```{r umaps after filtering, eval = umap_plot & any_bad_cells}
+SObj = suppressMessages(quick_reduction_rna(SObj, ndims = 20, nfeatures = 1000))
+mt = 'after_filtering'
+gga[['nCount_RNA']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'nCount_RNA',
+                                                            cap_top = 'auto', return_gg_object = T, my_title = mt,  pt.size = pt_size, do_shuffle = T,
+                                                            cont_or_disc = 'c')[[1]])
+gga[['percent.mt']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'percent.mt',
+                                                        cap_top = 'auto', return_gg_object = T, my_title = mt, 
+                                                        cont_or_disc = 'c', pt.size = pt_size,)[[1]])
+gga[['percent.ribo']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'percent.ribo',  pt.size = pt_size, do_shuffle = T,
+                                                          cap_top = 'auto', return_gg_object = T, my_title = mt,
+                                                          cont_or_disc = 'c')[[1]])
+if(nf_avail){
+  gga[['nuclear_fraction']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'nuclear_fraction',  pt.size = pt_size, do_shuffle = T,
+                                                                cap_top = 'auto',  return_gg_object = T, my_title = mt,
+                                                                cont_or_disc = 'c')[[1]])
+  gga[['cell_status']] = suppressMessages(jj_plot_features(SObj, reduction = 'umap', meta_features = 'cell_status',  pt.size = pt_size, do_shuffle = T,
+                                                          return_gg_object = T, my_title = mt, cont_or_disc = 'd')[[1]])
+}
+```
+
+`r if(umap_plot) {"### UMAP before and after filtering barcodes {.tabset}"}`
+
+`r if(umap_plot) {"In the 'low_quality' tab, barcodes that do not pass the filter criteria, i.e. 'low quality barcodes', are highlighted. The colour indicates the number of low quality neighbours for each barcode. Grey dots are barcodes passing all filters. The other plots compare UMAPs calculated before and after applying the filter thresholds, coloured by different QC metrics."}`
+
+```{r, results='asis', eval = umap_plot, fig.width=12, fig.height=10}
+for (i in 1:length(ggb)){
+  fplot = names(ggb)[i]
+  if(is.null(gga[[fplot]])){
+    gga[[fplot]] = ggplot() + theme_void()
+  }
+  cat("#### ", fplot,"\n")
+  print(cowplot::plot_grid(plotlist = c(ggb[fplot], gga[fplot]), ncol = 2))
+  cat('\n\n')
+}
+```
+
+`r if(umap_plot) {"### {-}"}`
+
+```{r Save data}
+#config$Seurat_filtered <- file.path(config$outputpath,
+  #                                       paste0("analysis/data/SeuratObj_merged_filtered.rds"))
+config$Seurat_filtered = file.path(dirname(config$Seurat_rawall), 'SeuratObj_filtered.rds')
+# paste0('SeuratObj_merged_filtered_', today,'.rds')
+saveRDS(SObj,file=file.path(analysis_dir, config$Seurat_filtered))
+write_yaml(config,file=params$config)
+```
+
+## SessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```

@@ -1,0 +1,303 @@
+---
+title: "Pathway plots for GSEA of differential expression between conditions"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  config_id: ""
+  date: !r Sys.Date()
+---
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", config_id = "CD4-CD8_A", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("stringr", "dplyr", "yaml", "knitr", "ggplot2", "patchwork", "ggprism")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r functions, echo=FALSE, warning=FALSE }
+
+wrap_text_by_word <- function(text_vector, n_char_newline) {
+    wrap_single <- function(text, n) {
+        words <- unlist(strsplit(text, " "))
+        result <- ""
+        line <- ""
+        
+        for (word in words) {
+            if (nchar(line) + nchar(word) + 1 <= n) {
+                if (line == "") {
+                    line <- word
+                } else {
+                    line <- paste(line, word)
+                }
+            } else {
+                result <- paste0(result, line, "\n")
+                line <- word
+            }
+        }
+        result <- paste0(result, line)
+        return(result)
+    }
+    
+    wrapped_result <- sapply(text_vector, function(x) wrap_single(x, n_char_newline), USE.NAMES = FALSE)
+    return(wrapped_result)
+}
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+savePlots <- TRUE
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+```
+
+```{r parameters, echo=FALSE}
+
+config_id <- params$config_id
+config_key <- paste0("GSEA_conditions", ifelse(nzchar(config_id), "_", ""), config_id)
+
+```
+
+```{r load_data, eval=T, echo=F}
+
+fgseaResults <- readRDS(file.path(analysis_dir, config[[config_key]]$results))
+pathwaySelection <- read.csv(file.path(analysis_dir, "metadata", "pathway_selection_cond_2026-03-04.csv"))
+
+```
+
+```{r label_mapping, eval=T, echo=F}
+
+idents <- unique(pathwaySelection$identity)
+comparisons <- unique(pathwaySelection$comparison)
+
+identLabels <- str_replace_all(idents, "_", " ")
+names(identLabels) <- idents
+
+comparisonLabels <- str_replace(comparisons, "_vs_", " vs. ")
+names(comparisonLabels) <- comparisons
+
+pathwayLabels <- unique(pathwaySelection$pathway)
+names(pathwayLabels) <- pathwayLabels
+
+pathwayLabels <- sub("^REACTOME", "R", pathwayLabels)
+pathwayLabels <- sub("^HALLMARK", "H", pathwayLabels)
+pathwayLabels <- gsub("ARYL_HYDROCARBON_RECEPTOR", "AHR", pathwayLabels)
+pathwayLabels <- gsub("NEGATIVE_REGULATION", "NEG._REG.", pathwayLabels)
+pathwayLabels <- gsub("MEDIATED_CYTOTOXICITY", "MED._CYTOTOX.", pathwayLabels)
+pathwayLabels <- gsub("EXPRESSION", "EXP.", pathwayLabels)
+pathwayLabels <- gsub("AMINO_ACIDS", "AAs", pathwayLabels)
+pathwayLabels <- gsub("POLARIZATION", "POL.", pathwayLabels)
+pathwayLabels <- gsub("_", " ", pathwayLabels)
+
+pathwayLabels <- wrap_text_by_word(pathwayLabels, n_char_newline = 20)
+
+```
+
+# Pathway barplots
+
+```{r pathway_barplots, eval=T, echo=F, results='asis', fig.dim=c(12, 3)}
+
+idents <- unique(pathwaySelection$identity)
+pathwayBarplots <- list()
+
+for (ident in idents) {
+    cat(paste0("## Identity: ", identLabels[ident]))
+    cat("\n\n")
+
+    pathwayBarplots[[ident]] <- list()
+
+    currSelection <- pathwaySelection %>% filter(identity == ident)
+    currComparisons <- unique(currSelection$comparison)
+    currSelection <- inner_join(
+        currSelection,
+        fgseaResults[[ident]],
+        by = c("comparison", "pathway"),
+        suffix = c("", ".y")
+    )
+
+    for (comp in currComparisons) {
+        cat(paste0("### Comparison: ", comparisonLabels[comp]))
+        cat("\n\n")
+
+        currSelectionComp <- currSelection %>% filter(comparison == comp) %>% select(!(all_of(c("leadingEdge"))))
+        currSelectionComp$neg_log_padj_signed <- (-1)*log10(currSelectionComp$padj_fdr_by_lib)*sign(currSelectionComp$NES)
+
+        currSelectionComp <- currSelectionComp %>% arrange(desc(NES))
+
+        pathwaysByDirection <- currSelectionComp %>% group_by(sign(NES)) %>% group_map(function(x, y) x$pathway)
+        pathwayLevels <- unlist(rev(pathwaysByDirection))
+        currSelectionComp$pathway <- factor(currSelectionComp$pathway, levels = rev(pathwayLevels))
+
+        currPathwayLabels <- pathwayLabels[pathwayLevels]
+
+        pathwayBarplots[[ident]][[comp]] <- ggplot(
+                currSelectionComp, aes(x = pathway, y = NES, fill = neg_log_padj_signed)
+            ) +
+            geom_col() +
+            coord_flip() +
+            scale_fill_gradient2(
+                low = "blue",
+                mid = "white",
+                high = "red",
+                limits = c(-3, 3),
+                oob = scales::squish,
+                midpoint = 0,
+                name = "Negative log(q),\nsigned"
+            ) +
+            scale_y_continuous(
+                limits = c(-2.5, 2.5),
+                oob = scales::squish
+            ) +
+            scale_x_discrete(
+                labels = currPathwayLabels
+            ) +
+            labs(
+                title = comparisonLabels[comp],
+                x = "Gene set",
+                y = "Normalized enrichment score"
+            ) +
+            theme_prism() +
+            theme(
+                plot.title = element_text(hjust = 0.5, size = 13),
+                legend.title = element_text(size = 11),
+                legend.text = element_text(size = 9),
+                axis.title.x = element_text(size = 11),
+                axis.text.x = element_text(size = 9),
+                axis.title.y = element_text(size = 11),
+                axis.text.y = element_text(size = 8),
+                legend.title.align = 0.5,
+            )
+
+        print(pathwayBarplots[[ident]][[comp]])
+        cat("\n\n")
+    }
+}
+
+pathwayBarplotsCombined <- 
+    pathwayBarplots[["CD4"]][["ICA_vs_DMSO"]] + labs(title = "ICA", x = "CD4\n\nGene set", y = NULL) +
+    pathwayBarplots[["CD4"]][["IVA_vs_DMSO"]] + labs(title = "IVA", x = NULL, y = NULL) +
+    pathwayBarplots[["CD4"]][["VA_vs_DMSO"]] + labs(title = "VA", x = NULL, y = NULL) +
+    pathwayBarplots[["CD8"]][["ICA_vs_DMSO"]] + labs(title = NULL, x = "CD8\n\nGene set", y = "NES") +
+    pathwayBarplots[["CD8"]][["IVA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = "NES") +
+    pathwayBarplots[["CD8"]][["VA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = "NES") +
+    plot_layout(ncol = 3, nrow = 2, guides = "collect")
+
+```
+
+```{r pathway_barplots_fitted_size, eval=T, echo=F, results='asis', fig.dim=c(20, 8)}
+
+pathwayBarplotsSizeFitted <- list()
+
+for (ident in names(pathwayBarplots)) {
+    pathwayBarplotsSizeFitted[[ident]] <- list()
+    for (comp in names(pathwayBarplots[[ident]])) {
+        pathwayBarplotsSizeFitted[[ident]][[comp]] <- pathwayBarplots[[ident]][[comp]] +
+            theme(
+                plot.title = element_text(hjust = 0.5, size = 5),
+                legend.title = element_text(size = 4),
+                legend.text = element_text(size = 4),
+                legend.key.size = unit(10, "pt"),
+                legend.key.height = unit(3, "mm"),
+                legend.key.width = unit(3, "mm"),
+                axis.title.x = element_text(size = 4, margin = margin(t = 2)),
+                axis.text.x = element_text(size = 4),
+                axis.ticks.length = unit(0.75, "mm"),
+                axis.title.y = element_text(size = 4),
+                axis.text.y = element_text(size = 3),
+                legend.title.align = 0.5,
+                axis.line = element_line(size = 0.5),
+                axis.ticks = element_line(size = 0.5)
+            )
+    }
+}
+
+# pathwayBarplotsSizeFittedCombined <-
+#     pathwayBarplotsSizeFitted[["CD4"]][["ICA_vs_DMSO"]] + labs(title = "ICA", x = "CD4\n\nGene set", y = NULL) +
+#     pathwayBarplotsSizeFitted[["CD4"]][["IVA_vs_DMSO"]] + labs(title = "IVA", x = NULL, y = NULL) +
+#     pathwayBarplotsSizeFitted[["CD4"]][["VA_vs_DMSO"]] + labs(title = "VA", x = NULL, y = NULL) +
+#     pathwayBarplotsSizeFitted[["CD8"]][["ICA_vs_DMSO"]] + labs(title = NULL, x = "CD8\n\nGene set", y = "NES") +
+#     pathwayBarplotsSizeFitted[["CD8"]][["IVA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = "NES") +
+#     pathwayBarplotsSizeFitted[["CD8"]][["VA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = "NES") +
+#     plot_layout(ncol = 3, nrow = 2, guides = "collect")
+    
+pathwayBarplotsSizeFittedCombined <-
+    pathwayBarplotsSizeFitted[["CD4"]][["ICA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = NULL) +
+    pathwayBarplotsSizeFitted[["CD4"]][["IVA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = NULL) +
+    pathwayBarplotsSizeFitted[["CD4"]][["VA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = NULL) +
+    pathwayBarplotsSizeFitted[["CD8"]][["ICA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = "NES") +
+    pathwayBarplotsSizeFitted[["CD8"]][["IVA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = "NES") +
+    pathwayBarplotsSizeFitted[["CD8"]][["VA_vs_DMSO"]] + labs(title = NULL, x = NULL, y = "NES") +
+    plot_layout(ncol = 3, nrow = 2, guides = "collect")
+
+```
+
+```{r save_plots, eval=savePlots, echo=F}
+
+plotPath <- file.path(analysis_dir, "fig", "pathway_barplots")
+if (!dir.exists(plotPath)) {dir.create(plotPath)}
+
+plotDataType <- "pdf"
+
+for (ident in names(pathwayBarplots)) {
+    for (comp in names(pathwayBarplots[[ident]])) {
+        ggsave(
+            file.path(plotPath, paste0("pathway_barplot_", ident, "_", comp, ".", plotDataType)),
+            pathwayBarplots[[ident]][[comp]],
+            width = 12, height = 3
+        )
+    }
+}
+
+ggsave(
+    file.path(plotPath, paste0("pathway_barplots_combined.", plotDataType)),
+    pathwayBarplotsCombined,
+    width = 21, height = 29.7/6
+)
+
+ggsave(
+    file.path(plotPath, paste0("pathway_barplots_combined_size_fitted.", plotDataType)),
+    pathwayBarplotsSizeFittedCombined,
+    width = 19.39, height = 5.76,
+    units = "cm"
+)
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

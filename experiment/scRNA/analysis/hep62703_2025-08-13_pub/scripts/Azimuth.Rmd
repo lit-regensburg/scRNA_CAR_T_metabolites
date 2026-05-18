@@ -1,0 +1,138 @@
+---
+title: "Azimuth annotation"
+author: "Paul Heinrich"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+---
+
+```{r date, echo=FALSE}
+
+today <- Sys.Date()
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries,include=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+
+# libraries
+
+libload<-c("rprojroot", "yaml","Seurat", "tidyverse", "future", "patchwork", "viridis", "Azimuth")
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, message = F, warning= F, error=T}
+
+save_data <- TRUE
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file("config.yaml")
+
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r loaddata}
+
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_filtered))
+
+```
+
+```{r azimuth}
+
+SObj <- RunAzimuth(query = SObj, reference = "/usr/local/lib/R/library/pbmcref.SeuratData/azimuth")
+
+```
+
+```{r plots }
+
+reduction <- config$scParam$dimred
+
+categories <- c(
+  "RNA_snn_res.0.3",
+  "RNA_snn_res.0.35",
+  "RNA_snn_res.0.45",
+  "predicted.celltype.l1",
+  "predicted.celltype.l2",
+  "predicted.celltype.l3"
+)
+
+category_plots <- list()
+
+for (category in categories) {
+  category_plots[[category]] <- DimPlot(SObj, group.by = category, reduction = reduction)
+}
+
+features <- c(
+  "mapping.score",
+  "predicted.celltype.l1.score",
+  "predicted.celltype.l2.score",
+  "predicted.celltype.l3.score",
+  "CD3D",
+  "CD3E",
+  "CD4",
+  "CD8A",
+  "CD8B"
+)
+
+feature_plots <- list()
+
+for (feature in features) {
+  feature_plots[[feature]] <- FeaturePlot(SObj, features = feature, order = TRUE, reduction = reduction)
+}
+
+```
+
+```{r save_plots, eval = save_data}
+
+plot_dir <- file.path(analysis_dir, config$outputpath$fig, "azimuth")
+
+for (category in names(category_plots)) {
+  ggsave(
+    file.path(plot_dir, paste0("umap_plot_", category, ".png")),
+    category_plots[[category]], width = 8, height = 6, dpi = 300,
+  )
+}
+
+for (feature in names(feature_plots)) {
+  ggsave(
+    file.path(plot_dir, paste0("umap_plot_", feature, ".png")),
+    feature_plots[[feature]], width = 8, height = 6, dpi = 300,
+  )
+}
+
+ggsave(
+  file.path(plot_dir, paste0("umap_plot_", category, ".png")),
+  category_plots[[category]], width = 10, height = 8, dpi = 300,
+)
+
+```
+
+```{r save_seurat, eval = save_data}
+
+saveRDS(SObj, file = file.path(analysis_dir, config$Seurat_filtered))
+
+```
+
+## SessionInfo()
+
+```{r sessionInfo,echo=T}
+
+sessionInfo()
+
+```

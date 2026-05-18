@@ -1,0 +1,203 @@
+---
+title: "doublet_detection"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+```{r date, echo=FALSE}
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries,include=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+
+libload<-c("rprojroot", "yaml", "Seurat", "SingleCellExperiment", "tidyverse", 'future', 'cowplot','knitr', 'jj', 'scDblFinder')
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo = F, message = F, warning= F, error=T}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multicore", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r default config, echo = F}
+#assuming orig.ident contains the sample names
+doublet_class = 'scDblFinder.class'
+doublet_score = 'scDblFinder.score'
+#set to FALSE if only plots should be generated but scDblFinder should not be run
+run_scDblFinder = TRUE
+```
+
+```{r custom functions, echo = F, message = F, warning= F, error=T}
+
+```
+
+```{r loaddata,eval=T,echo=F}
+SObj <- readRDS(file.path(analysis_dir, config$Seurat_rawall))
+pt_size = get_point_size(ncol(SObj))
+samples<-names(table(SObj@meta.data$orig.ident))
+```
+
+
+```{r run scDblFinder, echo=F}
+
+if(run_scDblFinder){
+  message('Running scDblFinder')
+  sce = as.SingleCellExperiment(SObj, assay = "RNA")
+
+  # TODO: Parallelize?
+
+  sce <- scDblFinder(sce, clusters=FALSE, samples="orig.ident")
+  
+  #get predictions as data.frame
+  dbl_df = as.data.frame(colData(sce))
+  dbl_df = dbl_df %>% 
+    #rownames_to_column('barcode') %>% 
+    dplyr::select(starts_with('scDblFinder'))
+  
+  #write the predictions as csv, add it to the Seurat object and adapt config
+  outname <- file.path(config$outputpath$table,"scDblFinder_predictions.csv")
+  config$scDbl_results = outname
+  write.csv(dbl_df,  file.path(analysis_dir, outname), row.names = T)
+  
+  SObj = AddMetaData(SObj, dbl_df)
+  stopifnot(!anyNA(SObj@meta.data[, doublet_class]))
+  write_rds(SObj, file.path(analysis_dir, config$Seurat_rawall))
+  
+  #write_yaml(config,file=params$config)
+  #rm(sce)
+}else{
+  # if(is.null(config$scDbl_results)){
+  #   stop('If run_scDblFinder=FALSE, config$scDbl_results should contain path to csv file with previous scDblFinder results')
+  # }else if(!file.exists(file.path(analysis_dir, config$scDbl_results))){
+  #   stop('If run_scDblFinder=FALSE, config$scDbl_results should contain path to csv file with previous scDblFinder results')
+  # }else{
+  #   message(sprintf('Skipping scDblFinder call. Loading results from %s.', file.path(analysis_dir, config$scDbl_results)))
+  # }
+  message(sprintf('Skipping scDblFinder call.'))
+}
+```
+
+
+```{r load predictions, message=F, echo=F, eval = F}
+#only read the predictions csv, if the column scDblFinder.class is still missing in the Seurat object
+if(!'scDblFinder.class' %in% colnames(SObj@meta.data)){
+  doublet_df = read.csv(file.path(analysis_dir, config$scDbl_results), row.names = 1)
+  SObj = AddMetaData(SObj, doublet_df)
+  stopifnot(!anyNA(SObj$scDblFinder.class))
+}
+```
+
+## Doublet count summary
+
+```{r doublet summary, echo=F, warning = F}
+#number of doublets
+#print(table(SObj@meta.data[, doublet_class]))
+
+SObj@meta.data %>%
+  dplyr::group_by(orig.ident) %>%
+  dplyr::count_(doublet_class) %>% 
+  spread(doublet_class, n) %>% 
+  dplyr::mutate(Percentage = 100*doublet / (singlet+doublet)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::add_row(orig.ident='Complete dataset', singlet = sum(.$singlet), doublet=sum(.$doublet), Percentage=100*sum(.$doublet)/(sum(.$singlet)+sum(.$doublet))) %>% kable
+# plot_df = SObj@meta.data %>% dplyr::group_by(DF_classification, orig.ident) %>% dplyr::summarise(fraction=n())
+# ggplot(plot_df, aes(fill = DF_classification, x=orig.ident, y = fraction)) +
+#   geom_bar(stat='identity', position="fill") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+jj_plot_categorical_by_group(SObj@meta.data, feature_column = doublet_class, group_column = 'orig.ident', flip_coordinates = T, add_text = T)
+
+```
+
+## Classification scores and relationship to cell count depth
+
+```{r violin plots, echo=F}
+jj_plot_numeric_by_group(SObj@meta.data, feature_column = 'nCount_RNA', group_column = doublet_class)
+jj_plot_numeric_by_group(SObj@meta.data, feature_column = doublet_score, group_column = doublet_class)
+#SObj$intermediate_score = SObj@meta.data[, doublet_score] < 0.75 & SObj@meta.data[, doublet_score] > 0.25 
+#table(SObj$intermediate_score, SObj@meta.data[, doublet_class])
+```
+
+```{r nCount-predictionscore scatter, warning=F, echo=F}
+FeatureScatter(SObj, 'nCount_RNA', doublet_score, group.by = doublet_class, raster=F)
+```
+
+## Doublet classification on the global UMAP {.tabset}
+
+```{r generate global umap, echo= F, message=F, warning = F}
+SObj = quick_reduction_rna(SObj, ndims = 20)
+gg = list()
+gg[['Sample']] = jj_plot_features(SObj, reduction =  'umap', meta_features = 'orig.ident', do_shuffle = T, pt.size = pt_size, return_gg_object = T)[[1]]
+gg[['nCount_RNA']] = jj_plot_features(SObj, reduction =  'umap', meta_features = 'nCount_RNA', cap_top = 'auto', return_gg_object = T, do_shuffle = T, pt.size = pt_size)[[1]]
+if(any(SObj@meta.data[, doublet_class] %in% 'doublet')){
+  gg[['Doublet density']] = try(jj_plot_features(SObj, reduction =  'umap', meta_features = doublet_class, facet_by =  'orig.ident', use_pointdensity = T, show_background_cells = T, foreground_subset_bool = SObj@meta.data[, doublet_class] %in% 'doublet', return_gg_object = T, do_shuffle = F, pt.size = pt_size)[[1]])
+}
+```
+
+```{r plot global umap, results='asis', echo = FALSE, warning = F}
+for (i in 1:length(gg)){
+  cat("### ",names(gg)[i],"\n")
+  print(gg[[i]])
+  cat('\n\n')
+}
+```
+
+## Doublet classification on per-sample UMAPs {.tabset}
+
+```{r umap single samples, results = 'asis', echo=F, message=F, warning=F}
+for(i in samples){
+  S_sub = SObj[, SObj$orig.ident == i]
+  pt_size = get_point_size(ncol(S_sub))
+  S_sub = quick_reduction_rna(S_sub, ndims = 20)
+  gg = list()
+  gg[['nCount_RNA']] = jj_plot_features(S_sub, reduction ='umap', meta_features = 'nCount_RNA', cap_top = 'auto', return_gg_object = T, pt.size = pt_size)[[1]] 
+  gg[[doublet_score]] = jj_plot_features(S_sub, reduction ='umap', meta_features = doublet_score, return_gg_object = T, pt.size = pt_size)[[1]] 
+  if(any(S_sub@meta.data[, doublet_class] %in% 'doublet')){
+    gg[['Doublet density']] = try(jj_plot_features(S_sub, reduction ='umap', meta_features = doublet_class, use_pointdensity = T, facet_by = doublet_class, facet_subset = 'doublet', return_gg_object = T, show_background_cells = T, pt.size = pt_size)[[1]])
+  }
+  cat("\n### ", i," {.tabset}\n")
+  for (i in 1:length(gg)){
+    cat("\n\n#### ",names(gg)[i],"\n")
+    print(gg[[i]])
+    cat('\n\n')
+  }
+  cat('### {-}\n\n')
+}
+```
+
+## SessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```

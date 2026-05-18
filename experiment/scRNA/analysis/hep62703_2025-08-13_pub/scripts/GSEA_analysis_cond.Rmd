@@ -1,0 +1,134 @@
+---
+title: "GSEA of differential expression between conditions"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  config_id: ""
+  date: !r Sys.Date()
+---
+
+# Notes
+
+**Column explanation:**
+
+* gene_set_lib: Gene set library
+* pathway: pathway or gene set from library
+* pval: unadjusted p-value
+* padj_fdr: FDR-adjusted p-value
+* NES: Normalized enrichment score. GSEA pathway enrichment score normalized by gene set size.
+A positive normalized enrichment score means upregulation in first group compared to the second group in
+the comparison
+* gene_set_coverage: Fraction of genes in the gene set that could be tested for differential expression
+* size: Size of the gene set (after removing untested genes)
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", config_id = "CD4-CD8_A", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("stringr", "dplyr", "yaml", "knitr")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+```
+
+```{r parameters, echo=FALSE}
+
+config_id <- params$config_id
+config_key <- paste0("GSEA_conditions", ifelse(nzchar(config_id), "_", ""), config_id)
+
+```
+
+```{r load_data,eval=T,echo=F}
+
+fgseaResults <- readRDS(file.path(analysis_dir, config[[config_key]]$results))
+
+```
+
+# Regulated pathways/gene sets by identity and comparison
+
+```{r show_fgsea_results, eval=T, echo=F, results='asis'}
+
+print(today)
+cat("\n\n")
+
+for (ident in names(fgseaResults)) {
+    cat(paste0("## ", ident))
+    cat("\n\n")
+    comparisons <- unique(fgseaResults[[ident]]$comparison)
+
+    for (comp in comparisons) {
+        cat(paste0("### ", comp))
+        cat("\n\n")
+
+        currTable <- fgseaResults[[ident]] %>%
+            filter(comparison == comp) %>%
+            select(!all_of(c("comparison", "ES", "padj", "log2err", "padj_fdr", "leadingEdge"))) %>%
+            rename(padj_fdr = padj_fdr_by_lib) %>%
+            filter(padj_fdr <= 0.1) %>%
+            arrange(padj_fdr) %>%
+            mutate(pval = format(pval, digits = 3, scientific = TRUE)) %>%
+            mutate(padj_fdr = format(padj_fdr, digits = 3, scientific = TRUE))
+
+        tableUp <- currTable %>% filter(NES >= 0)
+        tableDown <- currTable %>% filter(NES < 0)
+
+        cat("#### Upregulated")
+        cat("\n\n")
+
+        if (nrow(tableUp)) {
+            print(kable(tableUp))
+            cat("\n\n")
+        }
+
+        cat("#### Downregulated")
+        cat("\n\n")
+
+        if (nrow(tableDown)) {
+            print(kable(tableDown))
+            cat("\n\n")
+        }
+    }
+}
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

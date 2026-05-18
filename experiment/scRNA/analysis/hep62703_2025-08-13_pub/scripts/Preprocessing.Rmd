@@ -1,0 +1,495 @@
+---
+title: "Preprocessing"
+author: "Inma Hernandez & Nicholas Strieder, modified by Malte Simon"
+
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+```{r notes, eval = F, include = F}
+
+#The function Read10x is not flexible with the input file names
+#Expected are matrix.mtx, features.tsv and barcodes.tsv (.gz also ok) within the filtered_feature_bc_matrix folders
+#It might be necessary to rename files especially when using downloaded data with custom names (eg. from GEO). Replace substrings in all files e.g. with
+#for file in *; do mv "${file}" "${file/GSM6668927_P2_T./}"; done
+
+```
+
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries,echo=FALSE, warning=FALSE, message = F}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+libload<-c("rprojroot", "yaml", "Seurat","scales","tidyverse", "future","knitr", "DropletUtils", "DropletQC")
+invisible(sapply(libload, library, character.only = T))
+
+source("functions.R")
+
+```
+
+
+```{r setup, echo=FALSE, warning=FALSE}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+data_dir <- root_directories[["data"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+#create directories if not present
+sapply(config$outputpath, function(x) dir.create(file.path(analysis_dir, x), recursive = TRUE))
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r default config, echo = F}
+
+config$filters$min_cells = setIfNull(config$filters$min_cells, 5)
+
+```
+
+```{r custom functions, eval=T,echo=F,message=F,warning=F}
+
+loadndemux<-function(datdir){
+    # hashtags: anti human:A0251-A0260,A0262-A0265,A0276,B0251-B0260,C0251-C0260,C0262-C265
+    #           anti mouse:A0301-A0315,B0301-B310,C0301-C0310
+    hashtags <- c(paste("A0",c(251:260,262:265,276,301:315),sep=""),
+                  paste("B0",c(251:260,301:310),sep=""),
+                  paste("C0",c(251:260,262:265,301:310),sep=""))
+    # LoadData
+    # if named vector is supplied, the cellids are prefixed with the ID
+    if(length(names(datdir))==0){stop("No named vector supplied")}
+    matrices <- Read10X(data.dir = datdir)
+    # Demux
+    #To demultiplex, we will follow the ["Demultiplexing with hashtag oligos (HTOs)" pipeline from 
+    #Seurat](https://satijalab.org/seurat/v3.0/hashing_vignette.html):
+
+    SObj<-CreateSeuratObject(counts = matrices$`Gene Expression`, min.cells= config$filters$min_cells ,min.features=1)
+    # Add HTO as an independent assay
+    feattab<-suppressMessages(read_tsv(file.path(datdir,"features.tsv.gz"),col_names=F))
+    colnames(feattab)<-c("ID","name","type")
+
+    feattab <- feattab %>% filter(grepl("Antibody Capture",type))
+
+    # deal with modified matrices names
+    ABnames<-rownames(matrices$`Antibody Capture`)
+    if(!all(ABnames%in%pull(feattab,name))){
+        if(all(str_replace(ABnames,"[.].","")==pull(feattab,name))){
+            feattab$name<-ABnames
+          }else{
+            names(ABnames)<-str_replace(ABnames,"[.].","")
+            ABnames<-ABnames[pull(feattab,name)]
+            if(all(str_replace(ABnames,"[.].","")==pull(feattab,name))){
+                feattab$name<-ABnames
+            }else{
+              message("AB names are not matching")
+            }
+          }
+    }
+
+    
+    # select all IDs which match to hashtags from Biolegend, see above to update
+    hashtab <- feattab %>% filter(ID %in% hashtags)
+    # select all IDs which do not match to hashtags and use as CSFs
+    feattabf <- feattab %>% filter(!ID %in% hashtags)
+    
+    if(length(pull(hashtab,name="ID"))>0){
+        if(max(matrices$`Antibody Capture`[hashtab$name,])>0){
+            # there are hash antibodies in this library, 
+            # but maybe not all hashAB were used in this library
+        
+    # need to remove rows with rather low counts otherwise 'HTODemux' will fail
+    # for HTO there should be at least 0.1 % of the median reads from all other hashes
+    hashSums<-Matrix::rowSums(matrices$`Antibody Capture`[hashtab$name,])
+    hashthres<-median(hashSums)*0.001
+    # keep must be vector of names!!!
+    keephash<-hashtab$name[which(hashSums>hashthres)]
+    message(paste("processing library:" ,names(datdir),sep=""))
+    message(paste("Will keep hashes with reads above threshold: ",
+                  paste(names(keephash),collapse=", "),sep=""))
+    if(length(which(hashSums<hashthres))>0){
+    message(paste("Will discard hashes with reads below threshold: ",
+                  paste(names(which(hashSums<hashthres)),collapse=", "),sep=""))}
+
+    SObj[["HTO"]] <- CreateAssayObject(counts = matrices$`Antibody Capture`[keephash,])
+
+    #sanity check
+    if(!all(rownames(SObj[["HTO"]]) == str_replace_all(hashtab$name, "_", "-"))) {
+        stop("Error in selection of Hash AB names")
+    }
+    SObj  <- NormalizeData(SObj, assay = "HTO", normalization.method = "CLR")
+    # Demultiplex
+    
+    SObj <- HTODemux(SObj, assay = "HTO", positive.quantile = 0.99)
+    }else{print("No reads for Hashing AB found")}
+    }else{print("no hashing info available")}
+
+    if(length(pull(feattabf,name="ID"))>0){
+      if(max(matrices$`Antibody Capture`[feattabf$name,])>0){
+    # Add ADT as an independent assay
+    SObj[["ADT"]] <- CreateAssayObject(counts = matrices$`Antibody Capture`[feattabf$name,])
+    SObj <- NormalizeData(SObj, assay = "ADT", normalization.method = "CLR",margin=2)
+      }else{print("No reads for Feature AB found")}
+    }else{print("No feature info available")
+    }
+    return(SObj)
+}
+
+
+loadd<-function(datdir){
+    # LoadData
+    # if named vector is supplied, the cellids are prefixed with the ID
+    if(length(names(datdir))==0){stop("No named vector supplied")}
+    matrices <- Read10X(data.dir = datdir)
+    # Demux
+    #To demultiplex, we will follow the ["Demultiplexing with hashtag oligos (HTOs)" pipeline from 
+    #Seurat](https://satijalab.org/seurat/v3.0/hashing_vignette.html):
+
+    SObj<-CreateSeuratObject(counts = matrices, min.cells= config$filters$min_cells, min.features = 1)
+    return(SObj)
+}
+
+
+ridgeplot<-function(SObju){
+    
+kable(table(SObju$HTO_classification.global), caption = 'HTO classification global')
+kable(table(SObju$HTO_classification), caption = 'HTO classification fine')
+Idents(SObju) <- "HTO_maxID"
+pd<-RidgePlot(
+            object = SObju, 
+              assay = "HTO", 
+              features = rownames(SObju[["HTO"]]), 
+                ncol = 3
+              )
+print(pd)
+}
+
+
+dimred_fun<-function(SObj, type = 'pca'){
+    SObj_subset <- subset(
+                       SObj,
+                         subset = HTO_classification.global == "Negative",
+                         invert = TRUE
+                         )
+    DefaultAssay(SObj_subset) <- "HTO"
+    SObj_subset <- SObj_subset %>%
+      ScaleData(features = rownames(SObj_subset), verbose = TRUE) %>%
+        RunPCA(features = rownames(SObj_subset[["HTO"]]), approx = FALSE)
+    if(type == 'tsne'){
+      SObj_subset = RunTSNE(SObj_subset, dims = 1:2, perplexity = 100,check_duplicates = FALSE)
+    }else if(type == 'umap'){
+      SObj_subset = RunUMAP(SObj_subset, dims = 1:2) #does not make much sense with just two dimensions
+    }
+    pd <- DimPlot(SObj_subset, reduction = type, group.by = "HTO_classification.global")
+     print(pd)
+}
+
+#fails if old cellranger output is used: gene_barcode_matrix/ instead of feature_barcode_matrix/ -> tryCatch
+run_droplet_qc = function(path_to_data, out_name){
+  outs_dirs = dirname(path_to_data)
+  nf_list = list()
+  for(i in seq_along(outs_dirs)){
+      barcodepattern="gene_barcode_matrix$|feature_barcode_matrix$|filtered_feature_bc_matrix$"
+      barcodespath <- dir(outs_dirs[i],pattern=barcodepattern)
+      nf_temp = tryCatch({nuclear_fraction_tags(
+      outs = outs_dirs[i],
+      tiles = 100, cores = 6)}, error = function(x){
+        nuclear_fraction_tags(
+          bam = file.path(outs_dirs[i], 'possorted_genome_bam.bam'),
+          bam_index = file.path(outs_dirs[i], 'possorted_genome_bam.bam.bai'),
+          barcodes = file.path(barcodespath, 'barcodes.tsv.gz'),
+          tiles = 100, cores = 6)})
+    nf_temp$barcode = paste(names(path_to_data)[i], rownames(nf_temp), sep = '_')
+    nf_list[[names(path_to_data)[i]]] <- nf_temp
+  }
+  nf_df = dplyr::bind_rows(nf_list)
+  write_csv(nf_df, file = out_name)
+}
+
+```
+
+## Introduction
+
+HTO are cross-linked with antibodies that bind to ubiquitous cell surface proteins. We then multiplexed all batches and processed them into the same 10X Chromium Chip Channel ([GEM well](https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/glossary)), hence sequencing together HTO and single-cell gene expression reads (cDNA). Finally, we can detect inter-batch doublets as those cell barcodes that have high counts of two or more HTO.
+
+The objective of this notebook is to demultiplex the barcodes (cells) back to its original batch to discard doublets and negative cells.
+
+## Loading and demutlipexing the data 
+
+```{r find cellranger data,eval=T,echo=F,message=T,warning=F}
+
+# # Samples from inputdir
+# samples<-list.dirs(file.path(data_dir, config$inputpath),full.names=F,recursive=F)
+# sampnames<-sub("_run_[0-9]*","",sub("p[0-9A-z]{3}_","",samples))
+# if(any(grepl("_sc[A-z]{3,4}_",samples))){
+#    sampnames<-sub("sc[RTC][NCS][ARP].{0,1}_","",sampnames)
+# }
+# sampnames<-gsub("_","-",sampnames)
+# names(samples)<-sampnames
+# 
+# 
+# # cellranger outputpath
+# if(file.exists(file.path(data_dir, config$inputpath,samples[1],"outs", 'filtered_feature_bc_matrix'))){
+#   path_to_data <- sapply(samples, 
+#                          function(x) file.path(data_dir, config$inputpath,
+#                                     x,"outs","filtered_feature_bc_matrix"))
+# }else{
+#   path_to_data <- sapply(samples, 
+#                          function(x) file.path(data_dir, config$inputpath,
+#                                     x,"outs","filtered_gene_bc_matrices"))
+# }
+
+message('Searching for input files and generating sample names with maxlength=20')
+path_to_data = find_input_files(
+  file.path(data_dir, config$inputpath),
+  dir_pattern = 'filtered_feature_bc_matrices|filtered_feature_bc_matrix|filtered_gene_bc_matrices|filtered_gene_bc_matrix',
+  samples_to_exclude = config$libs_exclude,
+  ocm_output = config$on_chip_multiplexing
+)
+
+message('Cellranger output paths: ')
+message(paste(paste(names(path_to_data), path_to_data, sep = ": "), collapse='\n'))
+# harmony_template_df = data.frame(orig.ident = names(path_to_data), batch = names(path_to_data))
+# harmony_template_path <- file.path(config$outputpath$table, "harmony_template.csv")
+# message('Saving batch template for Harmony (which would treat each sample as one batch) in file:\n', harmony_template_path)
+# write_csv(harmony_template_df, file = file.path(analysis_dir, harmony_template_path))
+
+```
+
+```{r Print cellranger paths, message = FALSE, echo = F}
+
+#message again for command line (message printed to console when message = FALSE)
+message('Cellranger output paths: ')
+message(paste(paste(names(path_to_data), path_to_data, sep = ": "), collapse='\n'))
+
+## Harmony 
+if(!is.null(config$harmony_csv)){
+message('Found template for Harmony in file:\n', config$harmony_csv)}
+#There is a template for harmony.csv in the tables folder, which would treat each sample as one batch
+
+```
+
+```{r load data,eval=T,echo=F,message=T,warning=F}
+
+# load data into seurat, used named vector to have samples with names
+
+SObjl<-list()
+if(config$cellhash){
+  message('Cellhashing is set to `TRUE`')
+    # cellhasing used
+   for ( samp in names(path_to_data)){
+        SObjl[[samp]]<-loadndemux(path_to_data[samp])
+   }        
+
+}else{
+    # no cellhasing
+   for (samp in names(path_to_data)){
+       SObjl[[samp]]<-loadd(path_to_data[samp])
+   }
+}
+
+# save data as rds
+Seurat_rawobj<-list()
+for(samp in names(SObjl)){
+    outname <- file.path(config$outputpath$data,
+                         paste0("SeuratObj_raw_",samp,".rds"))
+    # datapath=file.path(config$outputpath,"data")
+    # if(!dir.exists(file.path(analysis_dir, datapath))){
+    #     dir.create(file.path(analysis_dir, datapath))
+    #    print("created data path")
+    # }
+    message(paste0('Saving ', outname))
+    saveRDS(SObjl[[samp]],file = file.path(analysis_dir, outname))
+    Seurat_rawobj[[samp]]<-outname
+}
+
+config$Seurat_rawobj <- Seurat_rawobj
+
+# join data as rds
+if (length(SObjl) > 1) {
+  SObjf <- merge(x = SObjl[[1]], y = SObjl[2:length(SObjl)])
+
+  # Merging Seurat object automatically creates layers which we do not want at this point, so join them for now
+
+  SObjf[["RNA"]] <- JoinLayers(SObjf[["RNA"]])
+} else {
+  SObjf = SObjl[[1]]
+}
+
+#sanity check on the species specification in config.yaml
+if(which_case(rownames(LayerData(SObjf, assay = "RNA", layer = "counts"))) == 'titlecase' & config$species == 'homo sapiens'){
+  warning('Gene names have title case, but species was set to `homo sapiens`. Wrong species specified?')
+}else if(which_case(rownames(LayerData(SObjf, assay = "RNA", layer = "counts"))) == 'uppercase' & config$species == 'mus musculus'){
+  warning('Gene names are uppercase, but species was set to `mus musculus`. Wrong species specified?')
+}
+
+```
+
+## DropletQC
+
+```{r DropletQC, eval = T, echo = F}
+
+# TODO: This does not work right now, as it searches for the bam files inside the cellranger count matrix folders
+
+dropletqc_file = file.path(analysis_dir, config$outputpath$table, "dropletQC_nuclear_fraction.csv")
+if(!file.exists(dropletqc_file)){
+  message('Running DropletQC')
+  try(run_droplet_qc(path_to_data = path_to_data, out_name = dropletqc_file))
+}
+
+if(file.exists(dropletqc_file)){
+  nf_df = read_csv(dropletqc_file)
+  meta_df = SObjf@meta.data
+  meta_df$barcode = rownames(meta_df)
+  meta_df = dplyr::left_join(meta_df, nf_df, by = 'barcode')
+  #then get the nCount nuclear_fraction
+  empty_drops = meta_df[, c('nuclear_fraction','nCount_RNA', 'barcode')]
+  empty_drops = empty_drops[complete.cases(empty_drops), ] 
+  #add the empty droplet classification
+  empty_drops = tryCatch({identify_empty_drops(empty_drops)},
+                         error = function(x){
+                           warning('An error occured in `identiy_empty_drops`: ', x)
+                           empty_drops})
+        
+  #the damaged cell classification can only be added after celltype identification
+  #empty_drops$celltype = 'Treg' #use singler results here in SingleR.Rmd
+  #empty_drops = identify_damaged_cells(empty_drops[, c('nuclear_fraction', 'nCount_RNA', 'cell_status', 'celltype')])
+  SObjf$nuclear_fraction = empty_drops$nuclear_fraction[match(meta_df$barcode, empty_drops$barcode)]
+  if('cell_status' %in% colnames(empty_drops)){
+    SObjf$cell_status = empty_drops$cell_status[match(meta_df$barcode, empty_drops$barcode)]
+  }
+}
+
+```
+
+```{r emptyDrops, eval = F, echo = F}
+
+# TODO: estimate empty droplets using DropletUtils, it appears that this currently does not work:
+# Error in .compute_ambient_stats(mat, totals, lower = lower) : no counts available to estimate the ambient profile (in p123 A test)
+
+##this requires to read in the raw_feature_matrix instead of the filtered one without setting any filters!
+library(DropletUtils)
+#https://github.com/MarioniLab/DropletUtils/issues/14
+#https://bioconductor.org/packages/devel/bioc/vignettes/DropletUtils/inst/doc/DropletUtils.html
+#raw feature barcode matrix should be used
+ass_df = LayerData(SObjf, assay = "RNA", layer = "counts")
+set.seed(100) #seed needed for reproducibility
+#lower is 100 by default -> barcodes with lower count are assumed to be empty droplets
+e.out <- emptyDrops(ass_df, lower = 100)  
+e_use = e.out[!is.na(e.out$FDR), ]
+cell_barcodes <- rownames(e_use)[e_use$FDR <= 0.01]
+writeLines(cell_barcodes, 'emptyDrops_predictedCells.txt')
+
+# We recommend making some diagnostic plots such as the total count against the negative log-probability. 
+# Droplets detected as cells should show up with large negative log-probabilities _or_ very large total counts (based on the knee point reported by `barcodeRanks`).
+plot(e.out$Total, -e.out$LogProb, col=ifelse(is.cell, "red", "black"),
+    xlab="Total UMI count", ylab="-Log Probability")
+```
+
+## Merged dataset overview
+
+```{r print object overview, echo = F}
+
+SObjf
+
+```
+
+```{r print n cells, echo = F}
+
+table(SObjf$orig.ident)
+
+```
+
+```{r save data,eval=T,echo=F}
+
+outname <- file.path(config$outputpath$data, "SeuratObj_raw_merged.rds")
+#paste("SeuratObj_raw_merged_",today,".rds",sep="")
+message(paste0('Saving ', outname))
+saveRDS(SObjf,file = file.path(analysis_dir, outname))
+config$Seurat_rawall <- outname
+write_yaml(config,file=params$config)
+
+```
+
+`r if(config$cellhash) {"## Cell hashing visualization"}`
+`r if(config$cellhash) {"### Ridge plots {.tabset}"}`
+    
+```{r ridgeplot,fig.height=10, fig.width=14,echo=FALSE,message=F,warning=F, eval = config$cellhash, results='asis'}
+
+for (samp in names(SObjl)) {
+  if("HTO" %in% names(SObjl[[samp]])) {
+        #print(paste("Ridge plot for sample: ",samp,sep=""))
+        cat("#### ", samp, "\n")
+        ridgeplot(SObjl[[samp]])
+        cat('\n\n')
+  }
+}
+
+```
+
+`r if(config$cellhash) {"### Heatmaps {.tabset}"}` 
+`r if(config$cellhash) {"In this heatmap, each column represents a 10X barcode, and each row the expression of a batch-specific HTO. We can visualize singlets, doublets and negative cells (ie not labelled by any HTO). We strive for a similar number of cells across batches, as this increases our ability to identify doublets."}`
+
+```{r Heatmap,eval= config$cellhash,,echo=FALSE,message=F,warning=F, results='asis'}
+
+for (samp in names(SObjl)) {
+  if("HTO" %in% names(SObjl[[samp]])) {
+    #print(paste("Heatmap for sample: ",samp,sep=""))
+    cat("#### ", samp, "\n")
+    pd<-HTOHeatmap(SObjl[[samp]], assay = "HTO", ncells = 5000)
+    print(pd)
+    cat('\n\n')
+  }
+}
+
+```
+
+`r if(config$cellhash) {"### tSNE {.tabset}"}` 
+
+`r if(config$cellhash) {"We can visualize the tSNE embedding of cells in HTO space. A clear separation of clusters would indicate a good labeling:"}`  
+  
+```{r tSNE, eval = config$cellhash,echo=FALSE,message=F,warning=F,  results='asis'}
+
+for (samp in names(SObjl)) {
+  if("HTO" %in% names(SObjl[[samp]])){
+    #print(paste("tSNE for sample: ",samp,sep=""))
+    cat("#### ", samp, "\n")
+    dimred_fun(SObjl[[samp]], type = 'pca')
+    cat('\n\n')
+  }
+}
+
+```
+
+## SessionInfo()
+
+```{r sessionInfo,echo=T}
+sessionInfo()
+```

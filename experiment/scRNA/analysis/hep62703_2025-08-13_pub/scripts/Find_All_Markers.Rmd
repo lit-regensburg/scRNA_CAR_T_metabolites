@@ -1,0 +1,372 @@
+---
+title: "Find_All_Markers"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+```{r date, echo=FALSE}
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+
+libload<-c("rprojroot", "yaml","tidyverse", "Seurat", "future", "WriteXLS", "clusterProfiler","jj") 
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+#stopifnot(has_valid_class(config$scParam$clusters, 'character'))
+
+```
+
+```{r default config,echo=FALSE}
+#Seurat/ArchR file from the config
+obj_use = 'Seurat_filtered'
+umap_use = config$scParam$dimred  #paste(c('umap', config$scParam$PCdims), collapse = '_')
+clusters = setIfNull(config$scParam$clusters, 'RNA_snn_res.0.2')
+make_plots = TRUE
+geneset_database = '/misc/rci/refdata/GO_genesets/'
+run_go = TRUE
+```
+
+```{r custom functions, include=F}
+generate_gsea_dot_plot <- function(dataset_list, cell_type_names) {
+  # This function generates a dot plot visualising GSEA results for a collection of cell types.
+  #   Dot colour will represent the NES, dot size the BH-adjusted P value. If the NES is NA, a dot
+  #   is grey. If the P value is NA, the dot is replaced by an x. The y axis harbours the gene sets,
+  #   the x axis harbours the cell types.
+  # dataset_list: A list of data frames with the columns "pathway", "NES" and "padj_BH. Each element
+  #   is considered to correspond to one cell type.
+  # cell_type_names: Character; The names of the cell types that should appear in the plots. The order
+  #   must correspond to the order of the dataset_list.
+  # plot_outfile_pdf: Character; Path to a PDF file where the plot will be saved.
+  # plot_outfilr_rds: Character; Path to an RDS file where the plot will be saved.
+  # plot_width: Numeric; The width of the plot.
+  # plot_height: Numeric; The hieght of the plot.
+  # Dependency: ggplot2
+  # Value: None; the function just generates and saves the dot plot.
+  # Authore: Niklas Beumer
+
+  # Add the cell type ID to each cell-type-specific data set.
+  # Also add information on whether the P value is NA.
+  # Also compute negative logarithms of the BH-adjusted P values.
+  gsea_res_w_id <- lapply(1:length(dataset_list), FUN = function(x) {
+    dataset <- dataset_list[[x]]
+    dataset$id <- cell_type_names[x]
+    dataset$pval_na <- sapply(dataset$padj_BH, FUN = function(y) { is.na(y) })
+    dataset$logp <- (-1) * log10(dataset$padj_BH)
+    return(dataset)
+  })
+
+  # Combine the cell-type-specific data sets.
+  gsea_res_comb <- do.call(rbind, gsea_res_w_id)
+  gsea_res_comb$id <- factor(gsea_res_comb$id, levels = cell_type_names)
+  gsea_res_comb$pathway <- factor(gsea_res_comb$pathway, levels = rev(sort(unique(gsea_res_comb$pathway))))
+
+  # Generate the dot plot.
+  dot_plot <- ggplot(gsea_res_comb, aes(x = id, y = pathway, colour = NES, size = logp, shape = pval_na)) +
+                        geom_point(stroke = 2) +
+    viridis::scale_color_viridis() + 
+    # scale_colour_gradient2(low = "blue", mid = "grey", high = "red",limits = c(0, 0.15), midpoint = 0.075,
+    #                        name = "Norm.\nenrichment\nscore", na.value = "black") +
+    scale_shape_manual(breaks = c(T, F), values = c(4, 16)) +
+    scale_size_area(na.value = 3) +
+   
+    guides(colour = guide_colourbar(order = 1),
+           size = guide_legend(title = "-log10(q)", order = 2),
+           shape = "none") +
+    xlab("Group") +
+    ylab("Gene set") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, colour = "black", hjust = 1, vjust = 0.5, size = 14),
+          axis.text.y = element_text(colour = "black"),
+          axis.ticks = element_line(colour = "black"),
+          axis.title = element_text(size = 16))
+
+  dot_plot
+  # Save the dot plot.
+  # pdf(plot_outfile_pdf, width = plot_width, height = plot_height)
+  # print(dot_plot)
+  # dev.off()
+  # saveRDS(dot_plot, file = plot_outfile_rds)
+
+}
+
+add_line_breaks = function(charvec, max_nchar = 25, split_only_at = NULL){
+  for(i in seq_along(charvec)){
+    if(is.null(split_only_at)){
+      charvec[i] = paste(strsplit(charvec[i], sprintf("(?<=.{%i})", max_nchar), perl = TRUE)[[1]], collapse = '\n')
+    }else{
+      str_subsets = strsplit(charvec[i], split_only_at)[[1]]
+      new_str = str_subsets[1]
+      str_subsets = str_subsets[-1]
+      max_nchar_use = max_nchar
+      while(length(str_subsets) > 0){
+        if(nchar(paste(c(new_str, str_subsets[1]), collapse = split_only_at)) > max_nchar_use){
+          col_val = '\n'
+          max_nchar_use = max_nchar_use + max_nchar
+        }else{
+          col_val = split_only_at
+        }
+        new_str = paste(c(new_str, str_subsets[1]), collapse = col_val)
+        str_subsets = str_subsets[-1]
+      }
+      charvec[i] = new_str
+    }
+  }
+  charvec
+}
+```
+
+```{r read gmt files, eval=run_go, include = F, echo = F}
+#https://www.gsea-msigdb.org
+if(config$species == 'mus musculus'){
+  gmt_files = list.files(paste0(geneset_database,'Mm/'), pattern = '.gmt$', full.names = T)
+  names(gmt_files) = gsub('^(.*).Mm.*$','\\1', basename(gmt_files))
+  message(sprintf('Reading gmt files from %s:\n%s', paste0(geneset_database,'Mm/'), paste(basename(gmt_files), collapse = '\n')))
+}else if(config$species == 'homo sapiens'){
+  gmt_files = list.files(paste0(geneset_database,'Hs/'), pattern = '.gmt$', full.names = T)
+  names(gmt_files) = gsub('^(.*).Hs.*$','\\1', basename(gmt_files))
+  message(sprintf('Reading gmt files from %s:\n%s', paste0(geneset_database,'Hs/'), paste(basename(gmt_files), collapse = '\n')))
+}
+
+go_list <- lapply(gmt_files, clusterProfiler::read.gmt)
+```
+
+```{r loaddata, eval=make_plots, echo=F}
+#todo: make data loading generic so it also works for scATAC
+obj <- readRDS(file.path(analysis_dir, config[[obj_use]]))
+pt_size = get_point_size(ncol(obj))
+dr_df = jj_get_reduction_coords(obj, umap_use)
+stopifnot(clusters %in% colnames(dr_df))
+```
+
+
+```{r find all markers, echo=F, eval = T, message=F}
+Idents(obj) = obj@meta.data[, clusters]
+# Find Markers which differ between on versus all other clusters
+marker_df <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+marker_list <- marker_df %>%
+  dplyr::relocate(gene) %>%
+  dplyr::arrange(desc(avg_log2FC)) %>%
+  dplyr::group_split(cluster)
+marker_list <- lapply(marker_list,function(x) as.data.frame(x))
+names(marker_list)<- underscore(levels(Idents(obj)))
+
+# Output list of marker genes per cluster
+outname <- sprintf('%s/%s_%s_all_markers.xlsx', config$outputpath$table, obj_use, gsub(' |/|\\.', '_', clusters))
+
+WriteXLS(marker_list,
+         ExcelFileName = file.path(analysis_dir, outname),
+         SheetNames=names(marker_list), #inserts Sheet_1 instead of '0' for Cluster 0
+         col.names = TRUE,
+         AdjWidth = TRUE,
+         BoldHeaderRow = TRUE)
+
+config$all_markers = outname
+write_yaml(config,file=params$config)
+```
+
+## UMAP coloured by groups
+
+```{r plot cluster umap, echo = F, message = F, eval = make_plots, warning = F}
+jj_plot_features(reduction = dr_df, meta_features = clusters, pt.size = pt_size, do_shuffle = T, cont_or_disc = 'd', label_type = 'geom_label',  label_col='white')
+top10_df = marker_df %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC)
+```
+
+## Upset plot
+
+Shows the sizes of the marker gene sets and their overlap.
+
+```{r marker feature overlap, echo = F}
+upset_list = lapply(marker_list, '[[', 'gene')
+jj_plot_upsetr(upset_list) 
+```
+
+## Heatmaps/Dotplot per group
+### Single-cell heatmap
+
+Plot the top markers by avg_lof2FC for each group in a cell sample of 2500 cells.
+
+```{r plot single-cell heatmap, echo = F, message = F, eval = make_plots, fig.width=12, fig.height=5+length(unique(top10_df$gene))/10}
+obj <- NormalizeData(obj, normalization.method = "LogNormalize", scale.factor = 10000, verbose = F)
+obj <- ScaleData(obj, features = unique(top10_df$gene), verbose = F)
+cellsamp<-sample(ncol(obj),min(ncol(obj), 2500),replace = F)
+DoHeatmap(obj, cells=cellsamp, features = unique(top10_df$gene)) + NoLegend()
+```
+
+### Per-cluster heatmap
+
+Get the mean expression of the top markers for each group and scale each feature.
+
+```{r plot group heatmap, echo = F, message = F, warning = F, eval = make_plots,  fig.width=12, fig.height=5+length(unique(top10_df$gene))/10}
+gmat = LayerData(obj, assay = "RNA", layer = "data")
+jj_plot_heatmap(gmat, features_use =  top10_df$gene, cluster_rows = F, cluster_columns = F, group_vec = obj@meta.data[[clusters]], transpose = T)
+```
+
+### Per-cluster dotplot
+
+Plot the top markers for each group as dotplot to additionally show the fraction of cells with detected gene expression.
+
+```{r plot group dotplot, echo = F, message = F, warning = F, eval = make_plots,  fig.width=12, fig.height=5+length(unique(top10_df$gene))/10}
+plot_dotplot(gmat, top10_df$gene,group_vec = obj@meta.data[[clusters]], cluster_columns = F, cluster_rows = F, scale_data = T, cap_top = 'q98')
+```
+
+## GO enrichment analysis {.tabset .tabset-fade .tabset-pills}
+
+```{r run go, eval = run_go, echo = F}
+go_res_list = list()
+for(i in seq_along(upset_list)){
+  #message(i, '/', length(upset_list))
+  go_res_list[[i]] = lapply(go_list, function(x) {
+    enricher(
+      gene = upset_list[[i]],
+      pvalueCutoff = 0.05,
+      pAdjustMethod = "BH",
+      minGSSize = 10,
+      maxGSSize = 500,
+      qvalueCutoff = 0.2,
+      TERM2GENE = x)
+    }
+  )
+}
+names(go_res_list) = names(upset_list)
+go_unlist = lapply(unlist(go_res_list), function(x) x@result)
+if(length(go_unlist) == 0){
+  warning('No GO results were obtained. Wrong reference genome specified in config.yaml?')
+  run_go = FALSE
+}else{
+  names(go_unlist) = paste(rep(names(upset_list), each = length(go_list)), names(go_list), sep = "__")
+go_unlist = lapply(go_unlist, function(x) x[, colnames(x) %in% c('ID','GeneRatio','BgRatio','pvalue','p.adjust','qvalue','geneID','Count')])
+
+outfile = file.path(analysis_dir, paste0(config$outputpath$table, "/go_results.xlsx"))
+message('Writing GO results to ', outfile)
+WriteXLS(go_unlist,
+         ExcelFileName = outfile,
+         SheetNames=names(go_unlist),
+         col.names = TRUE,
+         AdjWidth = TRUE,
+         BoldHeaderRow = TRUE)
+}
+
+```
+
+```{r prepare dotplots, include = F, eval = run_go}
+ggl = list()
+for(i in seq_along(go_res_list)){
+  gg = list()
+  for(j in seq_along(go_res_list[[i]])){
+     if(length(go_res_list[[i]][[j]]) > 0){
+      temp_res = go_res_list[[i]][[j]]@result
+      temp_res$qvalue[is.na(temp_res$qvalue)] = temp_res$p.adjust[is.na(temp_res$qvalue)] #qval is NA if only 1 result -> fix by setting padjusted as qvalue
+      if(sum(temp_res$p.adjust < 0.05 & temp_res$qvalue < 0.2) > 0){
+        gg[[ names(go_res_list[[i]])[j] ]] = dotplot(go_res_list[[i]][[j]], showCategory = 15, font.size = 8 )
+      }
+    }
+  }
+  ggl[[names(go_res_list)[i] ]] = gg
+}
+```
+
+```{r plot dotplots, results='asis', fig.width = 12, fig.height = 10, eval = run_go, echo = F}
+for(j in seq_along(ggl)){
+  cat("### ", names(ggl)[j], " {.tabset}\n")
+  for(i in seq_along(ggl[[j]])){
+    cat("#### ", names(ggl[[j]])[i], "\n")
+    print(ggl[[j]][[i]])
+    cat('\n\n')
+  }
+}
+```
+
+
+## Combined gene set dotplot {.tabset}
+
+Create an overview of unique and shared enriched gene sets between the groups. The number of pathways is limited to 50 currently (top x results by p-value ranking per group are selected until a combined number of < 51 pathways is reached). 
+
+```{r generate combined dotplot, include=F, eval = run_go}
+dp_list = list()
+for(j in names(go_list)){
+  #for the collection j, get the data.frame with enriched gene sets for each cluster as a list
+  common_collection_list = go_unlist[grepl(j, names(go_unlist))]
+  for(i in seq_along(common_collection_list)){
+    common_collection = common_collection_list[[i]]
+    common_collection$padj_BH = common_collection$qvalue
+    common_collection$pathway = common_collection$ID
+    common_collection$NES = sapply(strsplit(common_collection$GeneRatio, '/'), function(x) as.integer(x[1]) / as.integer(x[2]))
+    common_collection = common_collection[common_collection$padj_BH < 0.05, ]
+    common_collection = common_collection[common_collection$NES > 0.05, ]
+    common_collection_list[[i]] = common_collection
+  }
+  common_collection_list = common_collection_list[sapply(common_collection_list, nrow) > 0]
+  total_pathways = length(unique(unlist(sapply(common_collection_list, function(x) x$ID))))
+  while(total_pathways > 50){
+    new_head = max(sapply(common_collection_list, nrow)) -1
+    common_collection_list = lapply(common_collection_list, head, new_head)
+    total_pathways = length(unique(unlist(sapply(common_collection_list, function(x) x$ID))))
+  }
+  
+  common_collection_list = lapply(common_collection_list, function(x){
+    x$pathway = add_line_breaks(x$pathway, max_nchar = 50, split_only_at = '_')
+    x
+  })
+  
+  dp_list[[j]] = generate_gsea_dot_plot(common_collection_list, cell_type_names = gsub('^(.*)__.*$','\\1',names(common_collection_list)))
+  #save as png to avoid that long terms lead to squished dotplotgg
+  ggsave(file.path(analysis_dir, sprintf("%s/plot_file_%s.png",config$outputpath$fig, j)), plot = dp_list[[j]],  width = 12, height = 3+0.2*nrow(dp_list[[j]]$data), limitsize = FALSE) #typically heihgt 11
+}
+#max(sapply(dp_list, function(x) nrow(x$data)))
+```
+
+```{r plot combined dotplot, results='asis', width = 12, height = 10, eval = run_go, echo = F}
+for(j in seq_along(dp_list)){
+  cat("### ", names(dp_list)[j], "\n")
+  print(paste0('![](', file.path(analysis_dir, sprintf("%s/plot_file_%s.png",config$outputpath$fig, names(dp_list)[j])), ')'))
+  cat('\n\n')
+}
+```
+
+## SessionInfo()
+
+```{r sessionInfo,echo=T}
+sessionInfo()
+```

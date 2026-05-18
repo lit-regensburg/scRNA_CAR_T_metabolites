@@ -1,0 +1,2 @@
+Predefined models from scGate_models repository, commit c07ea2e778ce8db4ebb33bfb3e5c8fe85706dd36
+https://github.com/carmonalab/scGate_models/commit/c07ea2e778ce8db4ebb33bfb3e5c8fe85706dd36

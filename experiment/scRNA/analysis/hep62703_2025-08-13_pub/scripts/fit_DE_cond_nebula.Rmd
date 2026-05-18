@@ -1,0 +1,287 @@
+---
+title: "Differential expression between conditions"
+subtitle: "Testing with NEBULA"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  config_id: ""
+  date: !r Sys.Date()
+---
+
+# Notes
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", config_id = "CD4-CD8", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "yaml", "nebula", "foreach", "doParallel", "doRNG")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# Parallelization with doParallel
+
+registerDoParallel(6)
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r parameters, echo=FALSE}
+
+config_id <- params$config_id
+config_key <- paste0("DE_conditions", ifelse(nzchar(config_id), "_", ""), config_id)
+
+identCol <- config[[config_key]]$ident_col
+subjects <- config[[config_key]]$subjects
+relevantIdents <- config[[config_key]]$idents
+samplingSettings <- config[[config_key]]$sampling
+
+```
+
+```{r load_data, eval=T ,echo=F}
+
+SObj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+if (!is.factor(SObj[[]][[identCol]])) {
+    SObj[[]][[identCol]] <- factor(
+        SObj[[]][[identCol]],
+        levels = sort(unique(SObj[[]][[identCol]]))
+    )
+}
+
+idents <- levels(SObj[[]][[identCol]])
+
+if (is.null(relevantIdents)) {
+    relevantIdents <- idents
+}
+
+metadata <- SObj[[]]
+
+```
+
+```{r sample_cells, echo=FALSE}
+
+if (samplingSettings$sample) {
+    if (is.null(samplingSettings$mode)) {
+        stop("The 'mode' parameter must be supplied in the config sampling settings")
+    }
+
+    metadataSampled <- sample_replicates_metadata(
+        metadata,
+        ident_col = identCol,
+        replicate_col = "lib",
+        cond_col = "group",
+        mode = samplingSettings$mode
+    )
+
+    SObj <- subset(SObj, cells = rownames(metadataSampled))
+}
+
+```
+
+# Cell count plots
+
+```{r cell_count_fig_dim, echo=FALSE}
+
+figDim <- c(15, 3*(ceiling(length(relevantIdents)/3)))
+
+```
+
+```{r plot_cell_counts, echo=FALSE, results='asis', fig.dim = figDim}
+
+cat("## Cell counts, original data")
+cat("\n\n")
+
+cellCountsOriginal <- metadata %>% dplyr::group_by(across(all_of(c(identCol, "lib", "group")))) %>% count()
+
+cellCountPlotsOriginal <- plot_cell_counts(
+    cellCountsOriginal, ident_col = identCol, idents = relevantIdents,
+    cond_col = "group", replicate_col = "lib", y_col = "n"
+)
+print(cellCountPlotsOriginal$patchwork)
+
+cat("\n\n")
+
+cat("## Cell fractions, original data")
+cat("\n\n")
+
+cellFractions <- metadata %>% dplyr::group_by(across(all_of(c(identCol, "lib", "group")))) %>% count() %>%
+    ungroup() %>% dplyr::group_by(across(all_of(c(identCol, "lib")))) %>% mutate(prop = prop.table(n))
+
+cellFractionPlots <- plot_cell_counts(
+    cellFractions, ident_col = identCol, idents = relevantIdents,
+    cond_col = "group", replicate_col = "lib", y_col = "prop"
+)
+print(cellFractionPlots$patchwork)
+
+cat("\n\n")
+
+if (samplingSettings$sample) {
+    cat("## Cell counts, sampled data")
+    cat("\n\n")
+    cat(paste0("**Sampling mode: ", samplingSettings$mode, "**"))
+    cat("\n\n")
+
+    cellCountsSampled <- metadataSampled %>% dplyr::group_by(across(all_of(c(identCol, "lib", "group")))) %>% count()
+
+    cellCountPlotsSampled <- plot_cell_counts(
+        cellCountsSampled, ident_col = identCol, idents = relevantIdents,
+        cond_col = "group", replicate_col = "lib", y_col = "n"
+    )
+    print(cellCountPlotsSampled$patchwork)
+
+    cat("\n\n")
+}
+
+```
+
+```{r prepare_data, eval=T, echo=F }
+
+# Predictor variables are always lib and group! Must be set in Seurat object before fitting the model
+
+if (subjects == "none") {
+    SObj[[]][["subject"]] <- "S1"
+} else if (subjects == "replicate") {
+    SObj[[]][["subject"]] <- SObj[[]][["repl"]]
+} else if (subjects == "replicate-condition") {
+    SObj[[]][["subject"]] <- paste0(SObj[[]][["repl"]], "_", SObj[[]][["group"]])
+} else {
+    stop(paste0("Invalid value '", subjects, "' supplied for 'subjects' parameter"))
+}
+
+predictors <- c("lib", "group")
+selectCols <- c("ident", "subject", "repl", predictors, "nCount_RNA")
+
+varTable <- SObj[[]] %>% dplyr::rename(ident = all_of(identCol)) %>%
+    select(all_of(selectCols)) %>%
+    arrange(ident, group, lib)
+
+# Nebula requires data to be arranged by subject
+
+varTable <- varTable %>% arrange(subject)
+
+counts <- LayerData(SObj, assay = "RNA", layer = "counts")
+
+varTablesIdent <- list()
+countsIdent <- list()
+
+for (currIdent in relevantIdents) {
+    cellIds <- rownames(varTable %>% filter(ident %in% currIdent))
+    varTablesIdent[[currIdent]] <- varTable[cellIds, ]
+    countsIdent[[currIdent]] <- counts[, cellIds]
+}
+
+```
+
+```{r fit_nebula_model, eval=T, echo=F }
+
+modelFormula <- formula(paste0("~", paste0(predictors, collapse = "+")))
+modelMatrices <- list()
+
+for (ident in relevantIdents) {
+    contrastsArg <- list()
+
+    for (predictor in predictors) {
+        contrastsArg[[predictor]] <- contrasts(varTablesIdent[[ident]][[predictor]])
+        colnames(contrastsArg[[predictor]]) <- paste0("_", colnames(contrastsArg[[predictor]]))
+    }
+
+    modelMatrices[[ident]] <- model.matrix(
+        modelFormula,
+        data = varTablesIdent[[ident]],
+        contrasts.arg = contrastsArg
+    )
+}
+
+print(Sys.time())
+
+nebulaFit <- foreach(ident = relevantIdents) %dorng% {
+    print(paste0("Identity: ", ident))
+    print("Start")
+    print(Sys.time())
+
+    nebulaRes <- nebula(
+        count = countsIdent[[ident]],
+        id = pull(varTablesIdent[[ident]], "subject"),
+        pred = modelMatrices[[ident]],
+        offset = pull(varTablesIdent[[ident]], "nCount_RNA"),
+        model = "NBGMM",
+        method = "LN",
+        cpc = 0.005,
+        covariance = TRUE,
+        verbose = TRUE,
+        ncore = 1
+    )
+
+    print(paste0("Identity: ", ident))
+    print("End")
+    print(Sys.time())
+
+    nebulaRes
+}
+names(nebulaFit) <- relevantIdents
+
+print(Sys.time())
+
+```
+
+```{r save_data, echo=FALSE, warning=FALSE }
+
+filename <- paste0(
+    "fit_DE_cond_nebula",
+    ifelse(nzchar(config_id), paste0("-", config_id), ""),
+    ".rds"
+)
+
+config[[config_key]]$fit_results <- file.path(config$outputpath$data, filename)
+saveRDS(nebulaFit, file.path(analysis_dir, config[[config_key]]$fit_results))
+write_yaml(config, file = params$config)
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

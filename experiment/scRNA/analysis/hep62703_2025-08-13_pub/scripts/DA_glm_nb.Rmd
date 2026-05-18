@@ -1,0 +1,286 @@
+---
+title: "Differential abundance of identities between conditions"
+subtitle: "Analysis with glm.nb from MASS package"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+# Notes
+
+Differential identity abundance testing using glm.nb from the MASS package to perform negative binomial
+regression on ident counts. Normalization by total cell counts.
+
+```{r chunk_settings, echo=FALSE}
+
+knitr::opts_chunk$set(fig.dim = c(10, 10))
+
+```
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "tidyr", "ggplot2", "yaml", "knitr", "MASS")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+
+```
+
+```{r load_data,eval=T,echo=F}
+
+cellCountData <- read.csv(file.path(analysis_dir, config$outputpath$table, "cell_counts.csv"))
+SObj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+```
+
+```{r prepare_data, eval=T, echo=F}
+
+idents <- colnames(cellCountData)[3:ncol(cellCountData)]
+relevantIdents <- idents
+
+cellCountData[["lib"]] <- factor(cellCountData[["lib"]], levels = levels(SObj[[]][["lib"]]))
+cellCountData[["group"]] <- factor(cellCountData[["group"]], levels = levels(SObj[[]][["group"]]))
+cellCountData[["sample"]] <- paste0(cellCountData[["group"]], "_", cellCountData[["lib"]])
+
+countsAll <- t(cellCountData[, idents])
+colnames(countsAll) <- cellCountData[["sample"]]
+counts <- countsAll[relevantIdents, ]
+
+metacols <- c("group", "lib")
+coldata <- cellCountData[, metacols]
+rownames(coldata) <- cellCountData$sample
+
+```
+
+```{r model_fit, eval=T, echo=F, warning = FALSE}
+
+# Suppress warnings in output as they are only iteration limit warnings
+# These occur if the distribution is not overdispersed (theta goes towards infinity),
+# which is not a problem
+
+totalCounts <- apply(countsAll, 2, sum)
+logTotalCounts <- log(totalCounts + 1)
+
+fittedModels <- list()
+
+for (ident in relevantIdents) {
+    currData <- coldata
+    currData[["log_total_counts"]] <- logTotalCounts
+    currData[["y"]] <- counts[ident, ]
+
+    # # Alternation limit is reached for Enterocyte ident with default maxit of 25,
+    # # thus increase maxit
+
+    # if (ident == "Enterocyte") {
+    #     glmControl <- glm.control(maxit = 200)
+    # } else {
+    #     glmControl <- glm.control()
+    # }
+
+    glmControl <- glm.control()
+
+    fittedModels[[ident]] <- glm.nb(
+        formula = y ~ group + lib + offset(log_total_counts),
+        data = currData,
+        link = log,
+        control = glmControl,
+        x = TRUE
+    )
+}
+
+```
+
+# Differential abundance testing results
+
+```{r construct_contrasts, eval=T, echo=F}
+
+comparisons <- list(
+    c("ICA", "DMSO"),
+    c("VA", "DMSO"),
+    c("IVA", "DMSO")
+)
+
+names(comparisons) <- sapply(comparisons, function(x) paste(x, collapse = "_vs_"))
+
+modelMatrix <- model.matrix(fittedModels[[1]])
+contrastZeros <- rep(0, ncol(modelMatrix))
+names(contrastZeros) <- colnames(modelMatrix)
+
+contrasts <- list()
+
+for (comparison in names(comparisons)) {
+    groupA <- paste0("group", comparisons[[comparison]][1])
+    groupB <- paste0("group", comparisons[[comparison]][2])
+    currContrast <- contrastZeros
+
+    if (groupA %in% names(currContrast)) {
+        currContrast[groupA] <- 1
+    }
+    if (groupB %in% names(currContrast)) {
+        currContrast[groupB] <- -1
+    }
+    contrasts[[comparison]] <- currContrast
+}
+
+```
+
+```{r comparison_stats, eval=T, echo=F}
+
+comparisonStats <- data.frame()
+logConv <- log(exp(1), base = 2)
+confInt <- 0.95
+
+for (ident in names(fittedModels)) {
+    covMat <- vcov(fittedModels[[ident]])
+    betas <- coef(fittedModels[[ident]])
+
+    for (comparison in names(comparisons)) {
+        currContrast <- contrasts[[comparison]]
+        se <- sqrt(as.numeric(t(currContrast) %*% covMat %*% currContrast))
+        logFC <- as.numeric(currContrast %*% betas)
+        zStat <- logFC/se
+        pVal <- pnorm(abs(zStat), lower.tail = FALSE)*2
+
+        log2FC <- logFC*logConv
+        seLog2 <- se*logConv
+        normQuantile <- seLog2*qnorm((1-confInt)/2, lower.tail = FALSE)
+        ci_lower <- log2FC - normQuantile
+        ci_upper <- log2FC + normQuantile
+
+        currStats <- data.frame(
+            "ident" = ident,
+            "comparison" = comparison,
+            "log2FC" = log2FC,
+            "p_val" = pVal,
+            "std_err" = seLog2,
+            "CI_95_lower" = ci_lower,
+            "CI_95_upper" = ci_upper
+        )
+        comparisonStats <- rbind(comparisonStats, currStats)
+    }
+}
+
+# P value correction per ident
+
+comparisonStats <- as.data.frame(
+    comparisonStats %>% group_by(ident) %>%
+    mutate(p_adj_fdr = p.adjust(p_val, method = "BH")) %>% ungroup %>%
+    relocate(p_adj_fdr, .after = p_val) %>%
+    mutate(ident = factor(ident, levels = relevantIdents)) %>%
+    mutate(comparison = factor(comparison, levels = names(comparisons)))
+)
+
+```
+
+## Tables of DA results by ident
+
+```{r comparison_tables, eval=T, echo=F, results='asis'}
+
+for (currIdent in names(fittedModels)) {
+    cat(paste0("### Identity: ", currIdent))
+    cat("\n\n")
+
+    print(kable(comparisonStats %>% filter(ident %in% currIdent) %>% dplyr::select(!ident)))
+    cat("\n\n")
+}
+
+cat("## Comparisons below 5% FDR")
+
+kable(comparisonStats[comparisonStats$p_adj_fdr <= 0.05, ] %>% arrange(desc(log2FC)))
+
+```
+
+## Plots of DA results by ident
+
+Plots with 95% confidence intervals.
+
+```{r comparison_plots, eval=T, echo=F, results='asis', fig.dim=c(6, 10)}
+
+comparisonPlots <- list()
+
+for (currIdent in names(fittedModels)) {
+    cat(paste0("### Identity: ", currIdent))
+    cat("\n\n")
+
+    comparisonPlots[[currIdent]] <- ggplot(
+        comparisonStats %>% filter(ident == currIdent),
+        aes(x = comparison, y = log2FC)
+    ) +
+    geom_bar(stat="identity", color="black", position=position_dodge()) +
+    geom_errorbar(
+        aes(ymin = CI_95_lower, ymax = CI_95_upper), width=.2, linewidth = 1,
+        position=position_dodge(.9)
+    ) + coord_flip() + theme_bw()
+
+    print(comparisonPlots[[currIdent]])
+    cat("\n\n")
+}
+
+```
+
+```{r save_data, echo=FALSE, warning=FALSE }
+
+saveRDS(
+    fittedModels,
+    file.path(analysis_dir, config$outputpath$data, "DA_glm-nb_models.rds"),
+)
+
+write.csv(
+    comparisonStats,
+    file.path(analysis_dir, config$outputpath$table, "DA_glm-nb_stats.csv"),
+    quote = FALSE,
+    row.names = FALSE
+)
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

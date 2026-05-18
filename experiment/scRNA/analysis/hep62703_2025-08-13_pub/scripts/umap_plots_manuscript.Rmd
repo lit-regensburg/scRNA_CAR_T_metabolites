@@ -1,0 +1,571 @@
+---
+title: "Cluster and annotation assessment via UMAP plots"
+subtitle: "scRNA-seq of metabolite-treated T-cells"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  date: !r Sys.Date()
+---
+
+# Notes
+
+```{r chunk_settings, echo=FALSE}
+
+knitr::opts_chunk$set(fig.dim = c(10, 10))
+
+```
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load_libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload <- c("Seurat", "future", "stringr", "dplyr", "ggplot2", "knitr", "yaml", "scales", "viridis", "patchwork", "ggrastr", "ggprism")
+
+for (i in libload) {
+    library(i, character.only = T)
+}
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE }
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+plotPathBase <- file.path(analysis_dir, config$outputpath$fig)
+plotFileType <- "pdf"
+
+plotSubDirs <- c("umap_annot", "umap_markers")
+
+for (plotSubDir in plotSubDirs) {
+    plotDir <- file.path(plotPathBase, plotSubDir)
+    if (!dir.exists(plotDir)) {dir.create(plotDir)}
+}
+
+```
+
+```{r analysis_params, eval=T ,echo=F}
+
+sample_cells <- FALSE
+sample_prop <- 0.25
+
+annotation_key <- "annotation_T-cell-subtypes"
+
+clusterCol <- config$scParam$clusters
+annotCol <- config[[annotation_key]]$annotation_col
+condCol <- "group"
+libCol <- "lib"
+
+```
+
+```{r load_data, eval=T ,echo=F}
+
+SObj <- readRDS(file.path(analysis_dir, config[["Seurat_filtered"]]))
+
+```
+
+```{r sample_seurat_object, eval=T ,echo=F}
+
+if (sample_cells) {
+    cells_sampled <- SObj[[]] %>%
+        tibble::rownames_to_column("cell_id") %>%
+        group_by(.data[[clusterCol]]) %>%
+        group_map(
+            function(x, y) {
+                n_cells <- nrow(x)
+                n_cells_sample <- ceiling(sample_prop*n_cells)
+                sample(x[["cell_id"]], size = n_cells_sample, replace = FALSE)
+            }
+        )
+
+    names(cells_sampled) <- levels(SObj[[]][[clusterCol]])
+
+    SObj <- subset(SObj, cells = unlist(cells_sampled))
+}
+
+```
+
+```{r set_metadata, eval=T ,echo=F}
+
+annotLevels <- c(
+    "CD4_memory_like",
+    "CD4_memory_like_eff_1",
+    "CD4_memory_like_eff_2",
+    "CD4_prolif",
+    "CD4_pre_exhausted",
+    "CD4_exhausted",
+    "CD8"
+)
+
+SObj[[]][[annotCol]] <- factor(SObj[[]][[annotCol]], levels = annotLevels)
+
+azimuthL2_simple <- sort(unique(SObj[[]][["predicted.celltype.l2"]]))
+names(azimuthL2_simple) <- azimuthL2_simple
+
+azimuthL2_simple[!grepl("^CD8|^CD4", azimuthL2_simple)] <- "Other"
+azimuthL2_simple["CD4 Naive"] <- "Other"
+azimuthL2_simple[grepl("^CD8", azimuthL2_simple)] <- "CD8"
+azimuthL2_simple["dnT"] <- "dnT"
+
+azimuthL2_simple_Levels <- c(
+    "CD4 TCM",
+    "CD4 Proliferating",
+    "CD8",
+    "dnT",
+    "Other"
+)
+
+SObj[[]][["predicted.celltype.l2_simple"]] <- factor(
+    sapply(SObj[[]][["predicted.celltype.l2"]], function(x) azimuthL2_simple[x]),
+    levels = azimuthL2_simple_Levels
+)
+
+azimuthL2_simple_NK <- azimuthL2_simple
+azimuthL2_simple_NK["NK Proliferating"] <- "NK Proliferating"
+
+azimuthL2_simple_NK_Levels <- c(
+    "CD4 TCM",
+    "CD4 Proliferating",
+    "CD8",
+    "dnT",
+    "NK Proliferating",
+    "Other"
+)
+
+SObj[[]][["predicted.celltype.l2_simple_NK"]] <- factor(
+    sapply(SObj[[]][["predicted.celltype.l2"]], function(x) azimuthL2_simple_NK[x]),
+    levels = azimuthL2_simple_NK_Levels
+)
+
+```
+
+```{r custom_labels_colors, eval=T ,echo=F}
+
+annotLabels <- c(
+    "CD4_memory_like" = "CD4 mem. like",
+    "CD4_memory_like_eff_1" = "CD4 mem. like, eff. 1",
+    "CD4_memory_like_eff_2" = "CD4 mem. like, eff. 2",
+    "CD4_prolif" = "CD4 prolif.",
+    "CD4_pre_exhausted" = "CD4, exh. like early",
+    "CD4_exhausted" = "CD4, exh. like late",
+    "CD8" = "CD8"
+)
+
+#annotColors <- DiscretePalette(length(annotLabels), palette = "alphabet", shuffle = FALSE)
+#annotColors <- c("#E69F00", "#56B4E9", "#009E73", "#000000", "#0072B2", "#D55E00", "#CC79A7") #Okabe-Ito colorblind
+
+annotColors <- c("#F8766D", "#00B6EB", "#A58AFF", "#53B400", "#C49A00", "#00C094", "#FB61D7")
+names(annotColors) <- names(annotLabels)
+
+azimuthL2_simple_NK_Labels <- c(
+    "CD4 TCM" = "CD4 TCM",
+    "CD4 Proliferating" = "CD4 prolif.",
+    "CD8" = "CD8",
+    "dnT" = "dnT",
+    "NK Proliferating" = "NK prolif.",
+    "Other" = "Other"
+)
+
+azimuthL2_simple_NK_Colors <- c("#F8766D", "#53B400", "#FB61D7", "#C49A00", "#00B6EB", "black")
+names(azimuthL2_simple_NK_Colors) <- names(azimuthL2_simple_NK_Labels)
+
+```
+
+# UMAP plots of annotation and clusters
+
+## UMAP by annotation
+
+```{r umap_annots, eval=T, echo=F, fig.dim = c(8, 7)}
+
+umap_annot <- DimPlot(SObj, group.by = annotCol, reduction = config$scParam$dimred) +
+    scale_color_manual(
+        labels = annotLabels,
+        values = annotColors
+    ) +
+    scale_x_continuous(breaks=seq(-5, 7.5, 2.5), limits = c(-5, 8)) +
+    scale_y_continuous(breaks=seq(-6, 6, 3), limits = c(-6, 6)) +
+    labs(title = NULL, x = "UMAP 1", y = "UMAP 2") +
+    theme_prism() +
+    theme(
+        legend.text = element_text(size = 4),
+        legend.key.size = unit(8, "pt"),
+        axis.title.x = element_text(size = 9),
+        axis.text.x = element_text(size = 8),
+        axis.title.y = element_text(size = 9),
+        axis.text.y = element_text(size = 8),
+        legend.position = "bottom",
+        legend.justification = "center"
+    ) #+ guides(color = guide_legend(nrow = 3))
+
+umap_annot
+
+```
+
+## UMAP by annotation and condition
+
+```{r umap_annots_cond, eval=T, echo=F, fig.dim = c(12, 12)}
+
+umap_annot_cond <- DimPlot(SObj, group.by = annotCol, split.by = condCol, reduction = config$scParam$dimred, ncol = 2) +
+    scale_color_manual(
+        labels = annotLabels,
+        values = annotColors
+    ) +
+    labs(title = NULL, x = "UMAP 1", y = "UMAP 2")
+
+umap_annot_cond
+
+umap_annot_cond_size_fitted <- DimPlot(
+    SObj, group.by = annotCol, split.by = condCol,
+    pt.size = 0.01, reduction = config$scParam$dimred, ncol = 2
+) + 
+    scale_color_manual(
+        labels = annotLabels,
+        values = annotColors
+    ) +
+    labs(title = NULL, x = "UMAP 1", y = "UMAP 2") +
+    theme_prism() +
+    theme(
+        legend.text = element_text(size = 3),
+        legend.key.size = unit(5, "pt"),
+        axis.title.x = element_text(size = 8),
+        axis.text.x = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        axis.text.y = element_text(size = 7),
+        # axis.line = element_line(size = 0.1),
+        # axis.ticks = element_line(size = 0.1),
+        legend.position = "bottom",
+        legend.justification = "left"
+    )
+
+ggsave(
+    file.path(plotPathBase, "umap_annot", paste0("umap_annot_cond_size-fitted_rastered.", plotFileType)),
+    rasterize(umap_annot_cond_size_fitted, layer = "point", dpi = 600),
+    width = 21/2, height = 29.7/2, units = "cm"
+)
+ggsave(
+    file.path(plotPathBase, "umap_annot", paste0("umap_annot_cond_size-fitted.", plotFileType)),
+    umap_annot_cond_size_fitted,
+    width = 21/2, height = 29.7/2, units = "cm"
+)
+
+```
+
+## UMAP by annotation and library
+
+```{r umap_annots_lib, eval=T, echo=F, fig.dim = c(12, 12)}
+
+umap_annot_lib <- DimPlot(SObj, group.by = annotCol, split.by = libCol, reduction = config$scParam$dimred, ncol = 2) +
+    scale_color_manual(
+        labels = annotLabels,
+        values = annotColors
+    ) +
+    labs(title = NULL, x = "UMAP 1", y = "UMAP 2")
+
+umap_annot_lib
+
+```
+
+# UMAP plots Azimuth
+
+```{r umap_azimuthL2_simple_NK, eval=T, echo=F, fig.dim = c(8, 7)}
+
+umap_azimuthL2_simple_NK <- DimPlot(SObj, group.by = "predicted.celltype.l2_simple_NK", reduction = config$scParam$dimred, pt.size = 0.01) +
+    scale_color_manual(
+        labels = azimuthL2_simple_NK_Labels,
+        values = azimuthL2_simple_NK_Colors
+    ) +
+    scale_x_continuous(breaks=seq(-5, 7.5, 2.5), limits = c(-5, 8)) +
+    scale_y_continuous(breaks=seq(-6, 6, 3), limits = c(-6, 6)) +
+    labs(title = NULL, x = "UMAP 1", y = "UMAP 2") +
+    theme_prism() +
+    theme(
+        legend.text = element_text(size = 8),
+        legend.key.size = unit(8, "pt"),
+        axis.title.x = element_text(size = 9),
+        axis.text.x = element_text(size = 8),
+        axis.title.y = element_text(size = 9),
+        axis.text.y = element_text(size = 8),
+        legend.position = "bottom",
+        legend.justification = "center"
+    )
+
+umap_azimuthL2_simple_NK
+
+```
+
+## UMAP by clusters
+
+```{r umap_clusters, eval=T, echo=F, fig.dim = c(8, 7)}
+
+umap_clusters <- DimPlot(SObj, group.by = clusterCol, reduction = config$scParam$dimred, pt.size = 0.01) +
+    scale_x_continuous(breaks=seq(-5, 7.5, 2.5), limits = c(-5, 8)) +
+    scale_y_continuous(breaks=seq(-6, 6, 3), limits = c(-6, 6)) +
+    labs(title = NULL, x = "UMAP 1", y = "UMAP 2") +
+    theme_prism() +
+    theme(
+        legend.text = element_text(size = 8),
+        legend.key.size = unit(8, "pt"),
+        axis.title.x = element_text(size = 9),
+        axis.text.x = element_text(size = 8),
+        axis.title.y = element_text(size = 9),
+        axis.text.y = element_text(size = 8),
+        legend.position = "bottom",
+        legend.justification = "center"
+    )
+
+umap_clusters
+
+```
+
+## UMAP by clusters and condition
+
+```{r umap_clusters_cond, eval=T, echo=F, fig.dim = c(12, 12)}
+
+umap_clusters_cond <- DimPlot(SObj, group.by = clusterCol, split.by = condCol, reduction = config$scParam$dimred, ncol = 2) +
+    labs(title = NULL, x = "UMAP 1", y = "UMAP 2")
+
+umap_clusters_cond
+
+```
+
+## UMAP by clusters and library
+
+```{r umap_clusters_lib, eval=T, echo=F, fig.dim = c(12, 12)}
+
+umap_clusters_lib <- DimPlot(SObj, group.by = clusterCol, split.by = libCol, reduction = config$scParam$dimred, ncol = 2) +
+    labs(title = NULL, x = "UMAP 1", y = "UMAP 2")
+
+umap_clusters_lib
+
+```
+
+# UMAP marker plots
+
+```{r umap_markers, eval=T, echo=F, fig.dim = c(12, 9)}
+
+markers <- list()
+
+markers[["CD4_CD8"]] <- c(
+    "CD3D",
+    "CD3E",
+    "CD3G",
+    "CD4",
+    "CD8A",
+    "CD8B"
+)
+markers[["effector_like"]] <- c(
+    "GZMB",
+    "IFNG",
+    "PRF1",
+    "GNLY",
+    "NKG7",
+    "TBX21",
+    "GZMK",
+    "CCL4",
+    "CCL5"
+)
+markers[["memory_naive_like"]] <- c(
+    "CCR7",
+    "SELL",
+    "IL7R",
+    "TCF7",
+    "CD27",
+    "CD28",
+    "BCL2",
+    "FOXP1",
+    "LEF1"
+)
+markers[["exhaustion"]] <- c(
+    "TOX",
+    "PDCD1"
+)
+markers[["qc"]] <- c(
+    "nCount_RNA",
+    "nFeature_RNA",
+    "percent.mt",
+    "percent.ribo"
+)
+
+umap_markers <- list()
+max_cutoff <- sapply(names(markers), function(x) "q95")
+order_cells <- sapply(names(markers), function(x) FALSE)
+order_cells["effector_like"] <- TRUE
+order_cells["exhaustion"] <- TRUE
+
+for (markerGroup in names(markers)) {
+    umap_markers[[markerGroup]] <- list()
+
+    for (marker in markers[[markerGroup]]) {
+        umap_markers[[markerGroup]][[marker]] <- FeaturePlot(
+            SObj, features = marker,
+            reduction = config$scParam$dimred,
+            max.cutoff = max_cutoff[markerGroup],
+            order = order_cells[markerGroup],
+            pt.size = 0.01
+        ) +
+        scale_x_continuous(breaks=seq(-5, 7.5, 2.5), limits = c(-5, 8)) +
+        scale_y_continuous(breaks=seq(-6, 6, 3), limits = c(-6, 6)) +
+        labs(x = "UMAP 1", y = "UMAP 2") +
+        theme_prism() +
+        #scale_color_viridis() +
+        theme(
+            title = element_text(size = 10),
+            legend.text = element_text(size = 8),
+            legend.key.size = unit(8, "pt"),
+            axis.title.x = element_text(size = 9),
+            axis.text.x = element_text(size = 8),
+            axis.title.y = element_text(size = 9),
+            axis.text.y = element_text(size = 8)
+        )
+        
+        print(umap_markers[[markerGroup]][[marker]])
+
+        # ggsave(
+        #     file.path(plotPathBase, "umap_markers", paste0("umap_markers_", marker, ".", plotFileType)),
+        #     #rasterize(umap_markers[[markerGroup]][[marker]], layer = "point", dpi = 300),
+        #     umap_markers[[markerGroup]][[marker]],
+        #     width = 6, height = 6
+        # )
+    }
+}
+
+```
+
+```{r umap_markers_figures, eval=T, echo=F, fig.dim = c(12, 9)}
+
+umap_markers_comb_A <-
+    umap_clusters +
+    umap_annot +
+    umap_azimuthL2_simple_NK +
+    umap_markers[["CD4_CD8"]][["CD3D"]] +
+    umap_markers[["CD4_CD8"]][["CD3E"]] +
+    umap_markers[["CD4_CD8"]][["CD4"]] +
+    umap_markers[["CD4_CD8"]][["CD8A"]] +
+    umap_markers[["CD4_CD8"]][["CD8B"]] +
+    plot_layout(ncol = 2) + plot_annotation(tag_levels = 'A')
+
+# ggsave(
+#     file.path(plotPathBase, "umap_markers", paste0("umap_markers_fig_A.", plotFileType)),
+#     umap_markers_comb_A,
+#     width = 21, height = 29.7, units = "cm"
+# )
+
+umap_markers_comb_B <-
+    umap_markers[["effector_like"]][["GZMB"]] +
+    umap_markers[["effector_like"]][["IFNG"]] +
+    umap_markers[["effector_like"]][["GNLY"]] +
+    umap_markers[["memory_naive_like"]][["TCF7"]] +
+    umap_markers[["memory_naive_like"]][["CCR7"]] +
+    umap_markers[["memory_naive_like"]][["FOXP1"]] +
+    umap_markers[["memory_naive_like"]][["BCL2"]] +
+    umap_markers[["exhaustion"]][["TOX"]] +
+    plot_layout(ncol = 2) + plot_annotation(tag_levels = 'A')
+
+# ggsave(
+#     file.path(plotPathBase, "umap_markers", paste0("umap_markers_fig_B.", plotFileType)),
+#     umap_markers_comb_B,
+#     width = 21, height = 29.7, units = "cm"
+# )
+
+```
+
+```{r umap_markers_figures_rastered, eval=T, echo=F, fig.dim = c(12, 9)}
+
+umap_markers_comb_A_rastered <-
+    rasterize(umap_clusters, layer = "point", dpi = 600) +
+    rasterize(umap_annot, layer = "point", dpi = 600) +
+    rasterize(umap_azimuthL2_simple_NK, layer = "point", dpi = 600) +
+    rasterize(umap_markers[["CD4_CD8"]][["CD3D"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["CD4_CD8"]][["CD3E"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["CD4_CD8"]][["CD4"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["CD4_CD8"]][["CD8A"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["CD4_CD8"]][["CD8B"]], layer = "point", dpi = 600) +
+    plot_layout(ncol = 2) + plot_annotation(tag_levels = 'A')
+
+ggsave(
+    file.path(plotPathBase, "umap_markers", paste0("umap_markers_fig_A_rastered.", plotFileType)),
+    umap_markers_comb_A_rastered,
+    width = 21, height = 29.7, units = "cm"
+)
+
+umap_markers_comb_B_rastered <-
+    rasterize(umap_markers[["effector_like"]][["GZMB"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["effector_like"]][["IFNG"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["effector_like"]][["GNLY"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["memory_naive_like"]][["TCF7"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["memory_naive_like"]][["CCR7"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["memory_naive_like"]][["FOXP1"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["memory_naive_like"]][["BCL2"]], layer = "point", dpi = 600) +
+    # rasterize(umap_markers[["qc"]][["nCount_RNA"]], layer = "point", dpi = 600) +
+    # rasterize(umap_markers[["qc"]][["percent.mt"]], layer = "point", dpi = 600) +
+    rasterize(umap_markers[["exhaustion"]][["TOX"]], layer = "point", dpi = 600) +
+    plot_layout(ncol = 2) + plot_annotation(tag_levels = 'A')
+
+ggsave(
+    file.path(plotPathBase, "umap_markers", paste0("umap_markers_fig_B_rastered.", plotFileType)),
+    umap_markers_comb_B_rastered,
+    width = 21, height = 29.7, units = "cm"
+)
+
+```
+
+# QC UMAP plots
+
+## Counts, features percent mitochondrial/ribo
+
+```{r QC_counts, eval=T, echo=F, fig.dim = c(12, 9)}
+
+qc_features <- c(
+    "nCount_RNA",
+    "nFeature_RNA",
+    "percent.mt",
+    "percent.ribo"
+)
+
+umap_qc <- list()
+
+for (feature in qc_features) {
+    umap_qc[[feature]] <- FeaturePlot(
+        SObj, features = feature,
+        reduction = config$scParam$dimred
+    ) + scale_color_viridis()
+}
+
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+

@@ -1,0 +1,273 @@
+---
+title: "Marker genes"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  config_id: ""
+  date: !r Sys.Date()
+---
+
+
+```{r date, echo=FALSE}
+
+#params <- list(config = "config.yaml", date = Sys.Date())
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload<-c("rprojroot", "yaml","tidyverse", "Seurat", "future","jj","knitr") 
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+stopifnot(file.exists(file.path(analysis_dir, config$markers)))
+
+```
+
+```{r parameters, echo=FALSE}
+
+config_id <- params$config_id
+config_key <- paste0("markers", ifelse(nzchar(config_id), "_", ""), config_id)
+
+```
+
+```{r default config,echo=FALSE}
+#Seurat/ArchR file from the config
+obj_use = 'Seurat_filtered'
+umap_use = config$scParam$dimred #paste(c('umap', config$scParam$PCdims), collapse = '_')
+clusters = setIfNull(config$scParam$clusters, 'RNA_snn_res.0.2')
+marker_file = setIfNull(config[[config_key]], '')
+make_plots = TRUE #this will be set to false if no markers are available - the workflow runs through without error but generates no plots then
+```
+
+## Marker genes overview
+
+```{r load marker file, echo = F, warning=T, message=T}
+message('Reading marker file from path ', file.path(analysis_dir, marker_file))
+markers = read_markers(file.path(analysis_dir, marker_file))
+if(length(markers[[1]]) > 0){
+  mdf = head(jj_list_to_df(markers, long=F, fill_with = ''), 10)
+names(mdf) = sprintf("%s (%i)", names(mdf), sapply(markers, length))
+kable(mdf, caption = 'First 10 entries for each marker category with (n marker genes)')
+}
+
+if(length(markers) == 1){
+  markers = unlist(markers)
+  names(markers) = NULL
+}else{
+  markers = setNames(unlist(markers, use.names=F),rep(names(markers), lengths(markers)))
+}
+if(length(markers) == 0){
+  make_plots = FALSE
+  markers_avail = 0 #make vector non-empty since sizes of code chunks depend on its length
+  gmat_use = jj_initialize_df(2,2, row.names=c('a','b')) #initialize dummy df since sizes of code chunks depend on its rownames
+}
+```
+
+```{r loaddata,eval=make_plots,echo=F}
+obj <- readRDS(file.path(analysis_dir, config[[obj_use]]))
+pt_size = get_point_size(ncol(obj))
+dr_df = jj_get_reduction_coords(obj, umap_use)
+stopifnot(clusters %in% colnames(dr_df))
+```
+
+
+```{r filter marker genes, echo=F, eval = make_plots}
+features_avail = rownames(obj)
+
+markers = switch(which_case(features_avail),
+                 "lowercase"=tolower(markers),
+                 "titlecase"=tools::toTitleCase(tolower(markers)),
+                 "uppercase"=toupper(markers))
+
+markers_avail = markers[markers %in% features_avail]
+if(!all(markers %in% features_avail)){
+  message(sprintf('%i/%i marker genes present in the object. Missing genes:\n%s', length(markers_avail), length(markers), paste(markers[!markers %in% features_avail], collapse = '\n')))
+}
+if(length(markers_avail) == 0){
+  warning('No marker features were found. Skipping plots.')
+  make_plots = FALSE
+  markers_avail = 0 #make vector non-empty since sizes of code chunks depend on its length
+  gmat_use = jj_initialize_df(2,2, row.names=c('a','b')) #initialize dummy df since sizes of code chunks depend on its rownames
+}
+
+marker_groups <- unique(names(markers))
+
+```
+
+## Gene expression per group
+
+Use the groups defined in the config: `r clusters`
+
+```{r cluster umap, echo = F, message = F, warning = F, eval = make_plots}
+plot_df = jj_get_reduction_coords(obj, redname = umap_use)
+jj_plot_features(reduction = plot_df, meta_features = clusters, cont_or_disc = 'd', label_col='white', label_type = 'geom_label', pt.size = pt_size, do_shuffle = T)
+```
+
+### Heatmap
+
+If clusters are defined, get the mean expression per cluster and cluster on the scaled mean values in a heatmap. 
+
+```{r plot heatmap, echo = F, message = F, warning = F, eval = make_plots, fig.width=12, fig.height=5+length(markers_avail)/10}
+gmat = LayerData(obj, assay = "RNA", layer = "data")
+gmat = gmat[unique(markers_avail), , drop=F]
+gmat_use = gmat[apply(gmat, 1, function(x) n_distinct(x) > 1),,drop=F ]
+try(print(jj_plot_heatmap(gmat_use, features_use = rownames(gmat_use), group_vec = obj@meta.data[[clusters]], transpose = T)))
+```
+
+### Dotplot
+
+The dotplot additionally shows the fraction of cells within each group having at least one detected fragment for the markers.
+
+```{r plot dotplot, echo = F, message = F, warning = F, eval = make_plots, fig.width=12, fig.height=5+length(rownames(gmat_use))/10}
+try(print(plot_dotplot(gmat_use, features_use = rownames(gmat_use), group_vec = obj@meta.data[[clusters]], cluster_columns = T, cluster_rows = T, scale_data = T, cap_top = 'q98')))
+```
+
+## UMAP coloured by gene expression
+
+```{r make ggplots, message = F, echo = F, eval = make_plots}
+titles = NULL
+if(!is.null(names(markers_avail)[1])){
+  titles = paste0('Marker: ', names(markers_avail))
+}
+gg = jj_plot_features(seurat_obj = obj, reduction = umap_use, features = markers_avail, cap_top = 'auto', pt.size = pt_size, do_shuffle = T, return_gg_object = T)
+for(i in seq_along(gg)){
+  gg[[i]] = gg[[i]] +
+    viridis::scale_color_viridis(labels = scales::label_number(accuracy = 0.01)) +
+    labs(title= titles[i], colour=DefaultAssay(obj))
+}
+
+```
+
+```{r plot markers, results='asis', echo = FALSE, eval = make_plots}
+
+for (group in marker_groups) {
+  curr_markers <- markers_avail[names(markers_avail) == group]
+  curr_plots <- gg[names(markers_avail) == group]
+
+  cat(paste0("### Marker group: ", group, " {.tabset}"))
+  cat("\n\n")
+
+  for (i in 1:length(curr_plots)){
+    cat("#### ", curr_markers[i],"\n")
+    print(curr_plots[[i]])
+    cat('\n\n')
+  }
+}
+
+```
+
+## UMAP coloured by gene expression, ordered
+
+```{r make ggplots ordered, message = F, echo = F, eval = make_plots}
+titles = NULL
+if(!is.null(names(markers_avail)[1])){
+  titles = paste0('Marker: ', names(markers_avail))
+}
+gg = jj_plot_features(seurat_obj = obj, reduction = umap_use, features = markers_avail, cap_top = 'auto', pt.size = pt_size, do_order = T, return_gg_object = T)
+for(i in seq_along(gg)){
+  gg[[i]] = gg[[i]] +
+    viridis::scale_color_viridis(labels = scales::label_number(accuracy = 0.01)) +
+    labs(title= titles[i], colour=DefaultAssay(obj))
+}
+
+```
+
+```{r plot markers ordered, results='asis', echo = FALSE, eval = make_plots}
+
+for (group in marker_groups) {
+  curr_markers <- markers_avail[names(markers_avail) == group]
+  curr_plots <- gg[names(markers_avail) == group]
+
+  cat(paste0("### Marker group: ", group, " {.tabset}"))
+  cat("\n\n")
+
+  for (i in 1:length(curr_plots)){
+    cat("#### ", curr_markers[i],"\n")
+    print(curr_plots[[i]])
+    cat('\n\n')
+  }
+}
+
+```
+
+## Violin plots per group
+
+Show the distribution of gene expression values for each group. The circles below the violins indicate the fraction of cells with >0 transcripts in the group (black area). The mean gene expression is shown as red line.
+
+```{r make violins, message = F, echo = F, eval = make_plots}
+gg = list()
+titles = NULL
+if(!is.null(names(markers_avail)[1])){
+  titles = paste0('Marker: ', names(markers_avail))
+}
+
+#replace dash with underscore since ggplot throws error when - is in feature name
+rownames(gmat) = gsub('-', '_', rownames(gmat))
+markers_avail = gsub('-', '_', markers_avail)
+for(i in seq_along(markers_avail)){
+    gg[[i]] = jj_plot_sparse_by_group(gmat, 
+                                      gene_plot = markers_avail[i], 
+                                      group_vec =  obj@meta.data[[clusters]], 
+                                      plot_zero_fraction = T, plot_mean = T, order = F, cap_top = 'q99',
+                                      custom_colors = jj_get_jj_colours(gtools::mixedsort(unique(obj@meta.data[[clusters]]))))
+}
+
+```
+
+```{r plot violins, results='asis', echo = FALSE, eval = make_plots}
+
+for (group in marker_groups) {
+  curr_markers <- markers_avail[names(markers_avail) == group]
+  curr_plots <- gg[names(markers_avail) == group]
+
+  cat(paste0("### Marker group: ", group, " {.tabset}"))
+  cat("\n\n")
+
+  for (i in 1:length(curr_plots)){
+    cat("#### ", curr_markers[i],"\n")
+    print(curr_plots[[i]])
+    cat('\n\n')
+  }
+}
+
+```
+
+## SessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```
+

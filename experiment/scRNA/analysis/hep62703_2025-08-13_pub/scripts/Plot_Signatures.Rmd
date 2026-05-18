@@ -1,0 +1,197 @@
+---
+title: "Signature scores"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+params:
+  config: config.yaml
+  config_id: ""
+  date: !r Sys.Date()
+---
+
+```{r date, echo=FALSE}
+
+today <- params$date
+sprintf('Report run on %s.', today)
+
+```
+
+```{r load libraries, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+libload<-c("rprojroot", "yaml", "tidyverse", "Seurat", "future","knitr", "jj", "UCell", "gridExtra") 
+invisible(sapply(libload, library, character.only = T))
+
+# Custom functions
+
+source("functions.R")
+
+```
+
+```{r setup, echo=FALSE, warning=FALSE}
+
+set.seed(7)
+
+root_directories <- get_root_directories()
+analysis_dir <- root_directories[["analysis"]]
+
+config <- yaml.load_file(params$config)
+
+# parallelization in Seurat with future
+# see https://satijalab.org/seurat/articles/future_vignette.html
+plan("multisession", workers = 6)
+options(future.globals.maxSize= 2000*1024^2) #otherwise error that future max size is exceeded
+
+# bibliography
+try(knitr::write_bib(c(.packages()), file.path(analysis_dir, config$outputpath$report, "R.bib")))
+stopifnot(file.exists(file.path(analysis_dir, config$signatures)))
+
+```
+
+```{r parameters, echo=FALSE}
+
+config_id <- params$config_id
+config_key <- paste0("signatures", ifelse(nzchar(config_id), "_", ""), config_id)
+
+```
+
+```{r default config,echo=FALSE}
+#Seurat/ArchR file from the config
+obj_use = 'Seurat_filtered'
+umap_use = config$scParam$dimred #paste(c('umap', config$scParam$PCdims), collapse = '_')
+clusters = setIfNull(config$scParam$clusters, 'RNA_snn_res.0.2')
+signature_file = setIfNull(config[[config_key]], '')
+make_plots = TRUE
+```
+
+```{r load marker file, echo = F, warning=T, message=T}
+signature_list = read_markers(file.path(analysis_dir, signature_file))
+if(all(lengths(signature_list) == 0)) make_plots = FALSE
+```
+
+
+```{r loaddata, eval=make_plots, echo=F}
+obj <- readRDS(file.path(analysis_dir, config[[obj_use]]))
+pt_size = get_point_size(ncol(obj))
+dr_df = jj_get_reduction_coords(obj, umap_use)
+stopifnot(clusters %in% colnames(dr_df))
+```
+
+## Signature genes overview
+
+```{r filter marker genes, echo=F, eval = make_plots}
+sigdfbefore = head(jj_list_to_df(signature_list, long=F, fill_with = ''), 10)
+kable(sigdfbefore, caption = 'First 10 entries for each signature')
+
+features_avail = rownames(obj)
+for(i in seq_along(signature_list)){
+  signature_list[[i]] = switch(which_case(features_avail),
+                 "lowercase"=tolower(signature_list[[i]] ),
+                 "titlecase"=tools::toTitleCase(tolower(signature_list[[i]] )),
+                 "uppercase"=toupper(signature_list[[i]] ))
+}
+
+genes_before = sapply(signature_list, length)
+signature_missing_list = lapply(signature_list, function(x) x[!x %in% features_avail])
+sigdfafter = jj_list_to_df(signature_missing_list, long=F, fill_with = '')
+signature_list = lapply(signature_list, function(x) x[x %in% features_avail])
+genes_after = sapply(signature_list, length)
+if(!identical(genes_before, genes_after)){
+  message("Not all genes are available. Length of list before and after filtering for available genes:")
+  print(kable(tibble(rownames_to_column(data.frame(n_original=genes_before, n_available=genes_after), 'name'))))
+  kable(head(sigdfafter, 30), caption = 'Missing signature genes (max of 30 genes is shown per signature)')
+  #message(sprintf('%i/%i marker genes present in the object. Missing genes:\n%s', length(markers_avail), length(markers), paste(markers[!markers %in% features_avail], collapse = '\n')))
+}
+if(all(genes_after < 2)){
+  warning('All signatures contain less than 2 genes after filtering for available features. Skipping plots.')
+  make_plots = FALSE
+}else if(any(genes_after < 2)){
+  warning('Some signatures contain less than 2 genes and will not be plotted')
+  signature_list = signature_list[!genes_after < 2]
+}
+
+```
+
+```{r calculate module scores and make ggplots, message = F, echo = F, eval = make_plots}
+# titles = NULL
+# if(!is.null(names(signature_list)[1])){
+#   titles_seurat = paste0('Seurat Module: ', names(signature_list))
+#   titles_ucell = paste0('UCell Module: ', names(signature_list))
+# }
+signature_list = signature_list[gtools::mixedorder(names(signature_list))]
+signatures_plot = paste0(names(signature_list), '_SeuratModule')
+obj = AddModuleScore(obj, features = signature_list, ctrl = 100, name = 'signature_module_')
+obj <- AddModuleScore_UCell(obj, features = signature_list, name = "_UCellModule")
+obj@meta.data[, colnames(obj@meta.data) %in% signatures_plot] = NULL #remove columns with identical names to avoid duplicate meta.data columns
+colnames(obj@meta.data)[grepl('signature_module_', colnames(obj@meta.data))] = signatures_plot
+gg = jj_plot_features(seurat_obj = obj, reduction = umap_use, meta_features = signatures_plot, cap_top = 'q99', cap_bottom = 'q01', return_gg_object = T, pt.size = pt_size, do_shuffle = T)
+gg2 = jj_plot_features(seurat_obj = obj, reduction = umap_use, meta_features = gsub('_SeuratModule','_UCellModule', signatures_plot), cap_top = 'q99', cap_bottom = 'q01', return_gg_object = T, pt.size = pt_size, do_shuffle = T)
+for(i in seq_along(gg)){
+  gg[[i]] = gg[[i]] +
+    viridis::scale_color_viridis(labels = scales::label_number(accuracy = 0.01)) +
+    labs(title= 'SeuratModule', colour=DefaultAssay(obj))
+  gg2[[i]] = gg2[[i]] +
+    viridis::scale_color_viridis(labels = scales::label_number(accuracy = 0.01)) +
+    labs(title= 'UCellModule', colour=DefaultAssay(obj))
+}
+```
+## UMAP coloured by groups
+
+```{r cluster umap, echo = F, eval = make_plots}
+plot_df = jj_get_reduction_coords(obj, redname = umap_use)
+jj_plot_features(reduction = plot_df, meta_features = clusters, pt.size = pt_size, do_shuffle = T, cont_or_disc = 'd', label_col='white', label_type = 'geom_label')
+```
+
+## Signature heatmap
+
+Get the mean Seurat ModuleScore per group and plot as a heatmap.
+
+```{r plot heatmap, echo = F, message = F, eval = make_plots, warning = F}
+sig_mat = base::t(x = plot_df[, signatures_plot, drop = FALSE])
+sig_mat = sig_mat[complete.cases(sig_mat),, drop=FALSE]
+
+if(nrow(sig_mat) > 1){
+  hmap = tryCatch({
+    h1 = jj_plot_heatmap(sig_mat, features_use = rownames(sig_mat), group_vec = obj@meta.data[[clusters]], scale_data = T, transpose = T)
+    print(h1)
+  }, error=function(cond) {
+    h1 = jj_plot_heatmap(sig_mat, features_use = rownames(sig_mat), group_vec = obj@meta.data[[clusters]], scale_data = T, transpose = T, cluster_columns = F, cluster_rows = F)
+    print(h1)
+  })
+}
+
+```
+
+## Signature scores {.tabset}
+
+```{r plot signatures, results='asis', echo = FALSE, eval = make_plots}
+#required structure for tabset (number of # is important)
+## Results {.tabset}
+### tab 1
+#gg[[1]]
+### tab 2
+#gg[[2]]
+## {-}
+
+for (i in 1:length(gg)){
+  cat("### ",names(signature_list)[i],"\n")
+  grid.arrange(gg[[i]], gg2[[i]], ncol = 2)
+  cat('\n\n')
+}
+```
+
+```{r save seurat, echo = F, eval = make_plots}
+saveRDS(obj, file.path(analysis_dir, config[[obj_use]] ))
+```
+
+
+## SessionInfo()
+
+```{r sessionInfo,echo=T}
+sessionInfo()
+```
